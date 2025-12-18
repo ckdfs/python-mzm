@@ -1,0 +1,28 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual envs
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Training artifacts
+*.pt
+*.pth
+*.ckpt
+
+# Local artifacts (datasets/models)
+artifacts/
+*.npz
+
+# Logs
+*.log
