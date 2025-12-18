@@ -212,7 +212,7 @@ def plot_bias_scan(sim: SimulationResult) -> None:
     plt.plot(sim.bias_scan.V_scan, sim.bias_scan.P_scan_mW, "k", linewidth=1.5)
     plt.scatter([sim.bias_scan.V_bias], [sim.bias_scan.curr_P_mW], color="r", zorder=3)
     plt.axvline(sim.bias_scan.V_bias, color="r", linestyle="--")
-    plt.title("偏压扫描曲线")
+    plt.title("Bias Scan Curve")
     plt.xlabel("Bias Voltage (V)")
     plt.ylabel("Optical Power (mW)")
     plt.grid(True)
