@@ -315,41 +315,6 @@ def wrap_to_pi(theta_rad: np.ndarray | float) -> np.ndarray:
     return (th + np.pi) % (2.0 * np.pi) - np.pi
 
 
-def lockin_harmonics(
-    signal: np.ndarray,
-    *,
-    Fs: float,
-    f_ref: float,
-    harmonics: tuple[int, ...] = (1, 2),
-) -> Dict[int, Dict[str, float]]:
-    """Extract lock-in components at n*f_ref.
-
-    Returns a dict:
-        {n: {"I": in_phase_sin, "Q": quadrature_cos, "A": magnitude}}
-
-    Notes:
-    - We use sin/cos references and scale by 2/N so that a pure tone
-      signal(t)=a*sin(2*pi*f*t) yields I≈a, Q≈0.
-    """
-
-    x = np.asarray(signal, dtype=float)
-    N = x.size
-    if N == 0:
-        return {n: {"I": 0.0, "Q": 0.0, "A": 0.0} for n in harmonics}
-
-    t = np.arange(N, dtype=float) / float(Fs)
-    out: Dict[int, Dict[str, float]] = {}
-    for n in harmonics:
-        w = 2.0 * np.pi * (float(n) * float(f_ref))
-        s = np.sin(w * t)
-        c = np.cos(w * t)
-        I = float((2.0 / N) * np.sum(x * s))
-        Q = float((2.0 / N) * np.sum(x * c))
-        A = float(np.sqrt(I * I + Q * Q))
-        out[int(n)] = {"I": I, "Q": Q, "A": A}
-    return out
-
-
 @torch.no_grad()
 def _measure_pd_dither_1f2f_batch_torch(
     *,
@@ -376,7 +341,7 @@ def _measure_pd_dither_1f2f_batch_torch(
         raise ValueError("f_dither and Fs must be > 0")
 
     device = V_bias.device
-    dtype = torch.float64
+    dtype = torch.float32
     Vb = V_bias.reshape(-1).to(dtype=dtype)
     B = int(Vb.numel())
 

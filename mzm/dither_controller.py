@@ -34,7 +34,6 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from mzm.model import (
-    measure_pd_dither_1f2f,
     measure_pd_dither_1f2f_dbm_batch_torch,
     bias_to_theta_rad,
     theta_to_bias_V,
@@ -110,24 +109,36 @@ def generate_dataset_dbm_hist(
     V_prev = np.clip(V_bias - dv_prev, 0.0, Vpi).astype(np.float32)
 
     accel_norm = str(accel).lower().strip()
-    if accel_norm not in {"cpu", "auto", "cuda"}:
-        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda'")
+    if accel_norm not in {"cpu", "auto", "cuda", "mps"}:
+        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda', 'mps'")
 
     if accel_norm == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("accel='cuda' requested but torch.cuda.is_available() is False")
+    if accel_norm == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        raise RuntimeError("accel='mps' requested but MPS is not available")
 
     if accel_norm == "cpu":
         device = torch.device("cpu")
     elif accel_norm == "cuda":
         device = torch.device("cuda")
+    elif accel_norm == "mps":
+        device = torch.device("mps")
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # auto
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+
+    print(f"generate_dataset_dbm_hist using device: {device}")
 
     # Precompute lock-in references once per call, on the selected device.
     n_samples_time = int(
         round((float(dither_params.n_periods) / float(dither_params.f_dither)) * float(dither_params.Fs))
     )
-    t = torch.arange(n_samples_time, device=device, dtype=torch.float64) / float(dither_params.Fs)
+    t = torch.arange(n_samples_time, device=device, dtype=torch.float32) / float(dither_params.Fs)
     w = 2.0 * float(np.pi) * float(dither_params.f_dither)
     refs = {
         1: (torch.sin(w * t), torch.cos(w * t)),
@@ -247,12 +258,43 @@ def train_policy(
     hidden: int = 64,
     depth: int = 3,
     seed: int = 0,
+    accel: str = "auto",
 ) -> nn.Module:
     torch.manual_seed(seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    accel_norm = str(accel).lower().strip()
+    if accel_norm not in {"cpu", "auto", "cuda", "mps"}:
+        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda', 'mps'")
 
-    ds = TensorDataset(torch.from_numpy(Xn), torch.from_numpy(y))
+    if accel_norm == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("accel='cuda' requested but torch.cuda.is_available() is False")
+    if accel_norm == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        raise RuntimeError("accel='mps' requested but MPS is not available")
+
+    if accel_norm == "cpu":
+        device = torch.device("cpu")
+    elif accel_norm == "cuda":
+        device = torch.device("cuda")
+    elif accel_norm == "mps":
+        device = torch.device("mps")
+    else:
+        # auto
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+
+    print(f"train_policy using device: {device}")
+
+    # Optimization: Move entire dataset to device upfront.
+    # For small datasets (like 8000 samples), this eliminates the CPU->GPU transfer overhead
+    # in every batch iteration, which is the main bottleneck for MPS/GPU on small models.
+    X_dev = torch.from_numpy(Xn).to(device)
+    y_dev = torch.from_numpy(y).to(device)
+
+    ds = TensorDataset(X_dev, y_dev)
     dl = DataLoader(ds, batch_size=batch, shuffle=True, drop_last=False)
 
     model = DeltaVPolicyNet(in_dim=Xn.shape[1], hidden=hidden, depth=depth).to(device)
@@ -263,8 +305,6 @@ def train_policy(
         model.train()
         running = 0.0
         for xb, yb in dl:
-            xb = xb.to(device)
-            yb = yb.to(device)
             pred = model(xb)
             loss = loss_fn(pred, yb)
             opt.zero_grad(set_to_none=True)
@@ -330,17 +370,29 @@ def rollout_dbm_hist(
     accel: str = "auto",
 ) -> dict:
     accel_norm = str(accel).lower().strip()
-    if accel_norm not in {"cpu", "auto", "cuda"}:
-        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda'")
+    if accel_norm not in {"cpu", "auto", "cuda", "mps"}:
+        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda', 'mps'")
     if accel_norm == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("accel='cuda' requested but torch.cuda.is_available() is False")
+    if accel_norm == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        raise RuntimeError("accel='mps' requested but MPS is not available")
 
     if accel_norm == "cpu":
         device = torch.device("cpu")
     elif accel_norm == "cuda":
         device = torch.device("cuda")
+    elif accel_norm == "mps":
+        device = torch.device("mps")
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # auto
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+
+    print(f"rollout_dbm_hist using device: {device}")
 
     model = model.to(device)
 
@@ -348,7 +400,7 @@ def rollout_dbm_hist(
     n_samples_time = int(
         round((float(dither_params.n_periods) / float(dither_params.f_dither)) * float(dither_params.Fs))
     )
-    t_ref = torch.arange(n_samples_time, device=device, dtype=torch.float64) / float(dither_params.Fs)
+    t_ref = torch.arange(n_samples_time, device=device, dtype=torch.float32) / float(dither_params.Fs)
     w = 2.0 * float(np.pi) * float(dither_params.f_dither)
     refs = {
         1: (torch.sin(w * t_ref), torch.cos(w * t_ref)),
