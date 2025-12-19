@@ -8,6 +8,8 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, Any
 
+import torch
+
 
 @dataclass
 class NoiseResult:
@@ -348,6 +350,137 @@ def lockin_harmonics(
     return out
 
 
+@torch.no_grad()
+def _measure_pd_dither_1f2f_batch_torch(
+    *,
+    V_bias: torch.Tensor,
+    V_dither_amp: float,
+    f_dither: float,
+    Fs: float,
+    n_periods: int,
+    Vpi_DC: float,
+    ER_dB: float,
+    IL_dB: float,
+    Pin_dBm: float,
+    Responsivity: float,
+    R_load: float,
+    refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Torch batch core for PD dither 1f/2f measurement.
+
+    Returns tensors with batch dimension [B]. Internal math uses float64
+    for stability (especially when 2f is extremely small).
+    """
+
+    if f_dither <= 0 or Fs <= 0:
+        raise ValueError("f_dither and Fs must be > 0")
+
+    device = V_bias.device
+    dtype = torch.float64
+    Vb = V_bias.reshape(-1).to(dtype=dtype)
+    B = int(Vb.numel())
+
+    n_samples = int(round((float(n_periods) / float(f_dither)) * float(Fs)))
+    if n_samples < 16:
+        raise ValueError("n_samples too small; increase Fs or n_periods")
+
+    # Time base and dither waveform
+    t = torch.arange(n_samples, device=device, dtype=dtype) / float(Fs)
+    w1 = 2.0 * float(np.pi) * float(f_dither)
+    dither = float(V_dither_amp) * torch.sin(w1 * t)  # [N]
+    V_t = Vb[:, None] + dither[None, :]  # [B, N]
+
+    # DC transfer (same as mzm_dc_power_mW) in torch
+    Pin_W = 10.0 ** ((float(Pin_dBm) - 30.0) / 10.0)
+    E_in = float(np.sqrt(Pin_W))
+
+    loss_factor = 10.0 ** (-float(IL_dB) / 10.0)
+    er_linear = 10.0 ** (float(ER_dB) / 20.0)
+    gamma = (er_linear - 1.0) / (er_linear + 1.0)
+
+    phi1 = (float(np.pi) / float(Vpi_DC)) * (V_t / 2.0)
+    phi2 = (float(np.pi) / float(Vpi_DC)) * (-V_t / 2.0)
+    E_out = (
+        E_in
+        * float(np.sqrt(loss_factor))
+        * 0.5
+        * (torch.exp(1j * phi1) + float(gamma) * torch.exp(1j * phi2))
+    )
+    P_W = (torch.abs(E_out) ** 2)  # [B, N]
+
+    # PD current
+    I_pd = float(Responsivity) * P_W
+    pd_dc = I_pd.mean(dim=1)
+    I_ac = I_pd - pd_dc[:, None]
+
+    # Lock-in refs
+    if refs is None:
+        refs = {
+            1: (torch.sin(w1 * t), torch.cos(w1 * t)),
+            2: (torch.sin(2.0 * w1 * t), torch.cos(2.0 * w1 * t)),
+        }
+    s1, c1 = refs[1]
+    s2, c2 = refs[2]
+    if s1.device != device or s2.device != device:
+        raise ValueError("refs must be on the same device as V_bias")
+
+    # Ensure dtype consistency for stable dot-products.
+    s1 = s1.to(dtype=dtype)
+    c1 = c1.to(dtype=dtype)
+    s2 = s2.to(dtype=dtype)
+    c2 = c2.to(dtype=dtype)
+    I_ac = I_ac.to(dtype=dtype)
+
+    N = float(n_samples)
+    I1 = (2.0 / N) * torch.sum(I_ac * s1[None, :], dim=1)
+    Q1 = (2.0 / N) * torch.sum(I_ac * c1[None, :], dim=1)
+    A1 = torch.sqrt(I1 * I1 + Q1 * Q1)
+
+    I2 = (2.0 / N) * torch.sum(I_ac * s2[None, :], dim=1)
+    Q2 = (2.0 / N) * torch.sum(I_ac * c2[None, :], dim=1)
+    A2 = torch.sqrt(I2 * I2 + Q2 * Q2)
+
+    p1_W = 0.5 * (A1 ** 2) * float(R_load)
+    p2_W = 0.5 * (A2 ** 2) * float(R_load)
+
+    p1_dBm = 10.0 * torch.log10(p1_W * 1000.0 + 1e-30)
+    p2_dBm = 10.0 * torch.log10(p2_W * 1000.0 + 1e-30)
+
+    theta_rad = (float(np.pi) / float(Vpi_DC)) * Vb
+
+    if B == 0:
+        # Keep shapes predictable even for empty batches.
+        return {
+            "pd_dc": pd_dc,
+            "h1_I": I1,
+            "h1_Q": Q1,
+            "h1_A": A1,
+            "h2_I": I2,
+            "h2_Q": Q2,
+            "h2_A": A2,
+            "p1_W": p1_W,
+            "p1_dBm": p1_dBm,
+            "p2_W": p2_W,
+            "p2_dBm": p2_dBm,
+            "theta_rad": theta_rad,
+        }
+
+    return {
+        "pd_dc": pd_dc,
+        "h1_I": I1,
+        "h1_Q": Q1,
+        "h1_A": A1,
+        "h2_I": I2,
+        "h2_Q": Q2,
+        "h2_A": A2,
+        "p1_W": p1_W,
+        "p1_dBm": p1_dBm,
+        "p2_W": p2_W,
+        "p2_dBm": p2_dBm,
+        "theta_rad": theta_rad,
+    }
+
+
 def measure_pd_dither_1f2f(
     *,
     V_bias: float,
@@ -381,51 +514,40 @@ def measure_pd_dither_1f2f(
     - theta_rad: underlying operating angle (rad) from V_bias
     """
 
-    if f_dither <= 0 or Fs <= 0:
-        raise ValueError("f_dither and Fs must be > 0")
-
-    n_samples = int(round((float(n_periods) / float(f_dither)) * float(Fs)))
-    if n_samples < 16:
-        raise ValueError("n_samples too small; increase Fs or n_periods")
-
-    t = np.arange(n_samples, dtype=float) / float(Fs)
-    V_t = float(V_bias) + float(V_dither_amp) * np.sin(2.0 * np.pi * float(f_dither) * t)
-
-    # Use the same DC transfer model as mzm_dc_power_mW, then convert to PD current.
-    P_mW = mzm_dc_power_mW(V_t, Vpi_DC=Vpi_DC, ER_dB=ER_dB, IL_dB=IL_dB, Pin_dBm=Pin_dBm)
-    P_W = P_mW / 1000.0
-    I_pd = float(Responsivity) * P_W
-
-    pd_dc = float(np.mean(I_pd))
-    I_ac = I_pd - pd_dc
-
-    h = lockin_harmonics(I_ac, Fs=Fs, f_ref=float(f_dither), harmonics=(1, 2))
-
     feature = feature.lower().strip()
     if feature not in {"signed", "power"}:
         raise ValueError("feature must be 'signed' or 'power'")
 
-    # Always expose full lock-in components for downstream feature engineering.
-    h1_I = float(h[1]["I"])
-    h1_Q = float(h[1]["Q"])
-    h1_A = float(h[1]["A"])
-    h2_I = float(h[2]["I"])
-    h2_Q = float(h[2]["Q"])
-    h2_A = float(h[2]["A"])
+    # Keep this API pure-CPU to avoid surprising CUDA allocations
+    # during interactive use.
+    out = _measure_pd_dither_1f2f_batch_torch(
+        V_bias=torch.tensor([float(V_bias)], dtype=torch.float64, device=torch.device("cpu")),
+        V_dither_amp=float(V_dither_amp),
+        f_dither=float(f_dither),
+        Fs=float(Fs),
+        n_periods=int(n_periods),
+        Vpi_DC=float(Vpi_DC),
+        ER_dB=float(ER_dB),
+        IL_dB=float(IL_dB),
+        Pin_dBm=float(Pin_dBm),
+        Responsivity=float(Responsivity),
+        R_load=float(R_load),
+        refs=None,
+    )
 
-    # Convert harmonic current amplitude (peak) into electrical power at load.
-    # If i(t) = A*sin(wt), then P_avg = (A^2 / 2) * R.
-    def _amp_to_power_dBm(A: float, R: float) -> tuple[float, float]:
-        P_W = 0.5 * (float(A) ** 2) * float(R)
-        P_dBm = 10.0 * np.log10(P_W * 1000.0 + 1e-30)
-        return float(P_W), float(P_dBm)
+    pd_dc = float(out["pd_dc"][0].item())
+    h1_I = float(out["h1_I"][0].item())
+    h1_Q = float(out["h1_Q"][0].item())
+    h1_A = float(out["h1_A"][0].item())
+    h2_I = float(out["h2_I"][0].item())
+    h2_Q = float(out["h2_Q"][0].item())
+    h2_A = float(out["h2_A"][0].item())
+    p1_W = float(out["p1_W"][0].item())
+    p2_W = float(out["p2_W"][0].item())
+    p1_dBm = float(out["p1_dBm"][0].item())
+    p2_dBm = float(out["p2_dBm"][0].item())
+    theta = float(out["theta_rad"][0].item())
 
-    p1_W, p1_dBm = _amp_to_power_dBm(h1_A, R_load)
-    p2_W, p2_dBm = _amp_to_power_dBm(h2_A, R_load)
-
-    # Two-dimensional features for convenience.
-    # - For 1f, the signed in-phase component preserves slope direction.
-    # - For 2f, magnitude is robust to reference phase offsets.
     if feature == "signed":
         h1 = h1_I
         h2 = h2_A
@@ -433,7 +555,6 @@ def measure_pd_dither_1f2f(
         h1 = float(h1_A ** 2)
         h2 = float(h2_A ** 2)
 
-    theta = float(bias_to_theta_rad(V_bias, Vpi_DC=Vpi_DC))
     return {
         "pd_dc": pd_dc,
         "h1": h1,
@@ -451,3 +572,50 @@ def measure_pd_dither_1f2f(
         "R_load": float(R_load),
         "theta_rad": theta,
     }
+
+
+@torch.no_grad()
+def measure_pd_dither_1f2f_dbm_batch_torch(
+    *,
+    V_bias: torch.Tensor,
+    V_dither_amp: float = 0.05,
+    f_dither: float = 50e3,
+    Fs: float = 5e6,
+    n_periods: int = 200,
+    Vpi_DC: float = 5.0,
+    ER_dB: float = 30.0,
+    IL_dB: float = 6.0,
+    Pin_dBm: float = 10.0,
+    Responsivity: float = 0.786,
+    R_load: float = 50.0,
+    refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch/GPU-accelerated batch version of dither measurement.
+
+    Computes 1f/2f *power* features in dBm for a batch of bias voltages.
+
+    Parameters
+    - V_bias: 1D tensor of shape [B] (or any shape that flattens to B)
+    - refs: optional precomputed {harmonic: (sin_ref, cos_ref)} where each ref
+      has shape [N] on the same device as V_bias.
+
+    Returns
+    - p1_dBm: tensor [B]
+    - p2_dBm: tensor [B]
+    """
+
+    out = _measure_pd_dither_1f2f_batch_torch(
+        V_bias=V_bias,
+        V_dither_amp=float(V_dither_amp),
+        f_dither=float(f_dither),
+        Fs=float(Fs),
+        n_periods=int(n_periods),
+        Vpi_DC=float(Vpi_DC),
+        ER_dB=float(ER_dB),
+        IL_dB=float(IL_dB),
+        Pin_dBm=float(Pin_dBm),
+        Responsivity=float(Responsivity),
+        R_load=float(R_load),
+        refs=refs,
+    )
+    return out["p1_dBm"].to(dtype=torch.float32), out["p2_dBm"].to(dtype=torch.float32)

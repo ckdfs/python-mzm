@@ -17,6 +17,15 @@
 - 数据集生成 / 训练 / 回放：`mzm/dither_controller.py`
 - Notebook 流水线入口：`mzm_dither_controller.ipynb`
 
+补充：数据集生成支持可选 GPU 加速（torch）。
+
+实现说明（torch 加速路径）：
+- 目前导频测量/lock-in 的**核心计算已统一为 torch 批量实现**，因此
+  - `generate_dataset_dbm_hist(..., accel='auto')`：CUDA 可用则走 GPU，否则自动使用 torch-on-CPU。
+  - `rollout_dbm_hist(..., accel='auto')`：同样支持 CUDA/CPU 自动选择。
+- `torch_batch`：控制每次送入设备（通常是 GPU）的 bias 数量，显存不足时可调小。
+- PyTorch 在 CUDA 下会使用 caching allocator：即使张量已释放，`nvidia-smi` 可能仍显示占用显存（正常现象）。如需归还缓存给系统可手动调用 `torch.cuda.empty_cache()`。
+
 ---
 
 ## 2. MZM 物理模型
@@ -107,6 +116,8 @@ $$
 
 其中 $\mathcal{R}$ 为 responsivity（A/W）。代码中 `measure_pd_dither_1f2f()` 使用 `mzm_dc_power_mW()` 计算 $P(t)$，再乘以 $\mathcal{R}$ 得到 $I(t)$。
 
+补充：为支持 GPU/批量加速，当前实现中 `measure_pd_dither_1f2f()` 的底层计算已切换为 torch 批量核心（数值模型与上述推导等价），并保持其返回字段不变。
+
 ### 3.2 小信号展开与谐波来源
 
 设 $\Delta V(t)=A\sin(\omega t)$，其中 $\omega=2\pi f_d$。对电流（或功率）关于电压做泰勒展开：
@@ -135,7 +146,9 @@ $$
 \sin(n\Omega),\quad \cos(n\Omega),\quad \Omega=2\pi\frac{f_d}{F_s}.
 $$
 
-代码 `lockin_harmonics()` 对第 $k$ 阶谐波（$k=1,2$）提取：
+代码 `lockin_harmonics()` 给出了一个 NumPy 版本的锁相提取（便于对照推导/调试）。实际训练/数据集/回放默认使用 torch 批量核心在 CPU 或 GPU 上按同样公式计算。
+
+`lockin_harmonics()` 对第 $k$ 阶谐波（$k=1,2$）提取：
 
 $$
 I_k = \frac{2}{N}\sum_{n=0}^{N-1} x[n]\sin(k\Omega n),\quad
@@ -150,8 +163,7 @@ $$
 
 这种归一化使得若 $x(t)=a\sin(2\pi f_dt)$，则估计得到 $I_1\approx a$。
 
-`measure_pd_dither_1f2f()` 内部使用：
-
+`measure_pd_dither_1f2f()` / torch 批量核心的计算逻辑一致：
 - 先计算 $I_{\text{pd}}(t)$，减去均值得到 $I_{\text{ac}}$；
 - 再对 $I_{\text{ac}}$ 进行 lock-in 提取 1f 与 2f。
 
@@ -399,7 +411,8 @@ $$
 2. 随机采样目标角度 $\theta^*\sim\mathcal{U}(0,\pi)$（0–180°）。
 3. 随机采样上一拍动作 $\Delta V_{k-1}\sim\mathcal{U}(-\Delta V_{\max},\Delta V_{\max})$。
 4. 根据 $V_{k-1}=\mathrm{clip}(V_k-\Delta V_{k-1},0,V_\pi)$ 反推上一拍偏置。
-5. 分别在 $V_{k-1}$ 与 $V_k$ 下调用 `measure_pd_dither_1f2f()` 得到 `p1_dBm/p2_dBm`。
+5. 分别在 $V_{k-1}$ 与 $V_k$ 下测量 `p1_dBm/p2_dBm`。
+  - 实现上为提高速度，`generate_dataset_dbm_hist()` 使用 torch 批量接口（`measure_pd_dither_1f2f_dbm_batch_torch()`）一次性计算整批样本的导频特征。
 6. 构造差分特征 $dp1,dp2$。
 7. 将目标角度编码为 $(\sin\theta^*,\cos\theta^*)$，拼接得到 7 维输入特征。
 
@@ -574,6 +587,10 @@ $$
 - `V`：偏置轨迹
 - `err_deg`：wrapped 相位误差（度）
 
+补充：回放同样支持 torch 加速。
+- `rollout_dbm_hist(..., accel='auto')`：CUDA 可用则使用 GPU 进行导频测量与策略推理，否则使用 CPU。
+- 为降低每步开销，回放会在选定 device 上预先生成 lock-in 参考信号并在迭代中复用。
+
 ### 9.1 单步更新的“状态—观测—动作”闭环
 
 回放过程可以用以下变量描述：
@@ -680,8 +697,10 @@ requirements.txt 包含最小依赖：
 
 - `mzm/model.py`
   - `mzm_dc_power_mW()`：DC 传输曲线（用于导频仿真）
-  - `lockin_harmonics()`：锁相提取 1f/2f 的 I/Q/幅度
-  - `measure_pd_dither_1f2f()`：导频测量主函数，返回 p1_dBm/p2_dBm 等
+  - `lockin_harmonics()`：NumPy 参考版锁相提取（对照/调试用）
+  - `_measure_pd_dither_1f2f_batch_torch()`：torch 批量导频测量核心（CPU/GPU）
+  - `measure_pd_dither_1f2f()`：单点导频测量主函数（返回字段不变；内部调用 torch 核心）
+  - `measure_pd_dither_1f2f_dbm_batch_torch()`：批量输出 `p1_dBm/p2_dBm`（用于数据集/回放加速）
   - `bias_to_theta_rad()`, `theta_to_bias_V()`, `wrap_to_pi()`：角度/电压映射与 wrap
 
 - `mzm/dither_controller.py`

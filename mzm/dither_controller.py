@@ -33,7 +33,13 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from mzm.model import measure_pd_dither_1f2f, bias_to_theta_rad, theta_to_bias_V, wrap_to_pi
+from mzm.model import (
+    measure_pd_dither_1f2f,
+    measure_pd_dither_1f2f_dbm_batch_torch,
+    bias_to_theta_rad,
+    theta_to_bias_V,
+    wrap_to_pi,
+)
 
 
 @dataclass
@@ -81,6 +87,8 @@ def generate_dataset_dbm_hist(
     seed: int = 0,
     teacher_gain: float = 0.5,
     max_step_V: float = 0.2,
+    accel: str = "auto",
+    torch_batch: int = 512,
 ) -> dict:
     """Generate supervised dataset for realistic dbm_hist controller.
 
@@ -97,58 +105,86 @@ def generate_dataset_dbm_hist(
     # Target theta in [0, pi] (0..180 deg)
     theta_target = rng.uniform(0.0, float(np.pi), size=n_samples).astype(np.float32)
 
-    X = np.zeros((n_samples, 7), dtype=np.float32)
-    y = np.zeros((n_samples, 1), dtype=np.float32)
+    # Create a "previous" step consistent with a realistic controller history.
+    dv_prev = rng.uniform(-max_step_V, max_step_V, size=n_samples).astype(np.float32)
+    V_prev = np.clip(V_bias - dv_prev, 0.0, Vpi).astype(np.float32)
 
-    for i in range(n_samples):
-        vb = float(V_bias[i])
-        th_t = float(theta_target[i])
+    accel_norm = str(accel).lower().strip()
+    if accel_norm not in {"cpu", "auto", "cuda"}:
+        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda'")
 
-        # Create a "previous" step consistent with a realistic controller history.
-        dv_prev = float(rng.uniform(-max_step_V, max_step_V))
-        v_prev = float(np.clip(vb - dv_prev, 0.0, Vpi))
+    if accel_norm == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("accel='cuda' requested but torch.cuda.is_available() is False")
 
-        meas_prev = measure_pd_dither_1f2f(
-            V_bias=v_prev,
-            V_dither_amp=float(dither_params.V_dither_amp),
-            f_dither=float(dither_params.f_dither),
-            Fs=float(dither_params.Fs),
-            n_periods=int(dither_params.n_periods),
-            Vpi_DC=float(device_params.Vpi_DC),
-            ER_dB=float(device_params.ER_dB),
-            IL_dB=float(device_params.IL_dB),
-            Pin_dBm=float(device_params.Pin_dBm),
-            Responsivity=float(device_params.Responsivity),
-            R_load=float(device_params.R_load),
-        )
-        meas = measure_pd_dither_1f2f(
-            V_bias=vb,
-            V_dither_amp=float(dither_params.V_dither_amp),
-            f_dither=float(dither_params.f_dither),
-            Fs=float(dither_params.Fs),
-            n_periods=int(dither_params.n_periods),
-            Vpi_DC=float(device_params.Vpi_DC),
-            ER_dB=float(device_params.ER_dB),
-            IL_dB=float(device_params.IL_dB),
-            Pin_dBm=float(device_params.Pin_dBm),
-            Responsivity=float(device_params.Responsivity),
-            R_load=float(device_params.R_load),
-        )
+    if accel_norm == "cpu":
+        device = torch.device("cpu")
+    elif accel_norm == "cuda":
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        p1 = float(meas["p1_dBm"])
-        p2 = float(meas["p2_dBm"])
-        dp1 = p1 - float(meas_prev["p1_dBm"])
-        dp2 = p2 - float(meas_prev["p2_dBm"])
-        te = _target_encoding(np.array([th_t], dtype=np.float32))[0]
+    # Precompute lock-in references once per call, on the selected device.
+    n_samples_time = int(
+        round((float(dither_params.n_periods) / float(dither_params.f_dither)) * float(dither_params.Fs))
+    )
+    t = torch.arange(n_samples_time, device=device, dtype=torch.float64) / float(dither_params.Fs)
+    w = 2.0 * float(np.pi) * float(dither_params.f_dither)
+    refs = {
+        1: (torch.sin(w * t), torch.cos(w * t)),
+        2: (torch.sin(2.0 * w * t), torch.cos(2.0 * w * t)),
+    }
 
-        X[i, :] = np.array([p1, p2, dp1, dp2, dv_prev, te[0], te[1]], dtype=np.float32)
+    def _measure_dbm_torch(v_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        p1_out = np.empty((v_arr.size,), dtype=np.float32)
+        p2_out = np.empty((v_arr.size,), dtype=np.float32)
+        bs = int(max(1, torch_batch))
+        for start in range(0, v_arr.size, bs):
+            end = min(v_arr.size, start + bs)
+            vb = torch.from_numpy(v_arr[start:end]).to(device=device, dtype=torch.float32)
+            p1b, p2b = measure_pd_dither_1f2f_dbm_batch_torch(
+                V_bias=vb,
+                V_dither_amp=float(dither_params.V_dither_amp),
+                f_dither=float(dither_params.f_dither),
+                Fs=float(dither_params.Fs),
+                n_periods=int(dither_params.n_periods),
+                Vpi_DC=float(device_params.Vpi_DC),
+                ER_dB=float(device_params.ER_dB),
+                IL_dB=float(device_params.IL_dB),
+                Pin_dBm=float(device_params.Pin_dBm),
+                Responsivity=float(device_params.Responsivity),
+                R_load=float(device_params.R_load),
+                refs=refs,
+            )
+            p1_out[start:end] = p1b.detach().cpu().numpy()
+            p2_out[start:end] = p2b.detach().cpu().numpy()
+        return p1_out, p2_out
 
-        # Teacher label: proportional step in wrapped phase error
-        th_c = float(bias_to_theta_rad(vb, Vpi_DC=device_params.Vpi_DC))
-        err = float(wrap_to_pi(th_t - th_c))
-        dv = float(teacher_gain) * float(theta_to_bias_V(err, Vpi_DC=device_params.Vpi_DC))
-        dv = float(np.clip(dv, -max_step_V, max_step_V))
-        y[i, 0] = np.float32(dv)
+    p1, p2 = _measure_dbm_torch(V_bias)
+    p1_prev, p2_prev = _measure_dbm_torch(V_prev)
+
+    dp1 = (p1 - p1_prev).astype(np.float32)
+    dp2 = (p2 - p2_prev).astype(np.float32)
+    te = _target_encoding(theta_target.astype(np.float32))
+
+    X = np.stack(
+        [
+            p1.astype(np.float32),
+            p2.astype(np.float32),
+            dp1,
+            dp2,
+            dv_prev.astype(np.float32),
+            te[:, 0].astype(np.float32),
+            te[:, 1].astype(np.float32),
+        ],
+        axis=1,
+    ).astype(np.float32)
+
+    # Teacher label: proportional step in wrapped phase error
+    th_c = bias_to_theta_rad(V_bias.astype(float), Vpi_DC=device_params.Vpi_DC).astype(np.float32)
+    err = wrap_to_pi(theta_target.astype(float) - th_c.astype(float)).astype(np.float32)
+    dv = float(teacher_gain) * theta_to_bias_V(err.astype(float), Vpi_DC=device_params.Vpi_DC).astype(np.float32)
+    dv = np.clip(dv, -max_step_V, max_step_V).astype(np.float32)
+    y = dv.reshape(-1, 1).astype(np.float32)
 
     mu = X.mean(axis=0)
     sigma = X.std(axis=0) + 1e-8
@@ -266,7 +302,7 @@ def save_model(
 
 
 def load_model(path: str | Path) -> tuple[nn.Module, dict]:
-    ckpt = torch.load(Path(path), map_location="cpu")
+    ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
     model = DeltaVPolicyNet(in_dim=int(ckpt["arch"]["in_dim"]))
     model.load_state_dict(ckpt["model_state"])
     model.eval()
@@ -291,9 +327,33 @@ def rollout_dbm_hist(
     theta_target_deg: float,
     V_init: float,
     steps: int = 60,
+    accel: str = "auto",
 ) -> dict:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    accel_norm = str(accel).lower().strip()
+    if accel_norm not in {"cpu", "auto", "cuda"}:
+        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda'")
+    if accel_norm == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("accel='cuda' requested but torch.cuda.is_available() is False")
+
+    if accel_norm == "cpu":
+        device = torch.device("cpu")
+    elif accel_norm == "cuda":
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     model = model.to(device)
+
+    # Precompute lock-in references once on the chosen device.
+    n_samples_time = int(
+        round((float(dither_params.n_periods) / float(dither_params.f_dither)) * float(dither_params.Fs))
+    )
+    t_ref = torch.arange(n_samples_time, device=device, dtype=torch.float64) / float(dither_params.Fs)
+    w = 2.0 * float(np.pi) * float(dither_params.f_dither)
+    refs = {
+        1: (torch.sin(w * t_ref), torch.cos(w * t_ref)),
+        2: (torch.sin(2.0 * w * t_ref), torch.cos(2.0 * w * t_ref)),
+    }
 
     Vpi = float(device_params.Vpi_DC)
     th_t = float(np.deg2rad(theta_target_deg))
@@ -314,8 +374,9 @@ def rollout_dbm_hist(
     theta_deg_hist: list[float] = []
 
     for _ in range(int(steps)):
-        meas = measure_pd_dither_1f2f(
-            V_bias=float(V),
+        vb_t = torch.tensor([float(V)], device=device, dtype=torch.float32)
+        p1_t, p2_t = measure_pd_dither_1f2f_dbm_batch_torch(
+            V_bias=vb_t,
             V_dither_amp=float(dither_params.V_dither_amp),
             f_dither=float(dither_params.f_dither),
             Fs=float(dither_params.Fs),
@@ -326,10 +387,11 @@ def rollout_dbm_hist(
             Pin_dBm=float(device_params.Pin_dBm),
             Responsivity=float(device_params.Responsivity),
             R_load=float(device_params.R_load),
+            refs=refs,
         )
 
-        p1 = float(meas["p1_dBm"])
-        p2 = float(meas["p2_dBm"])
+        p1 = float(p1_t[0].item())
+        p2 = float(p2_t[0].item())
         dp1 = 0.0 if prev_p1 is None else (p1 - float(prev_p1))
         dp2 = 0.0 if prev_p2 is None else (p2 - float(prev_p2))
 
@@ -420,6 +482,7 @@ def main() -> int:
             theta_target_deg=float(tgt),
             V_init=V_init,
             steps=60,
+            accel="auto",
         )
         final_err = float(r["err_deg"][-1]) if r["err_deg"].size else float("nan")
         print(f"rollout target={tgt:6.1f} deg | initV={V_init:.3f} V | final_err={final_err:+.2f} deg")
