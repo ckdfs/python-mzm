@@ -21,8 +21,12 @@ Thumbs.db
 *.ckpt
 
 # Local artifacts (datasets/models)
-artifacts/
+artifacts/*
 *.npz
 
 # Logs
 *.log
+
+# Allow tracking of best model and its eval stats
+!artifacts/dither_policy_dbm_hist_best.pt
+!artifacts/dither_policy_dbm_hist_best_eval.npz

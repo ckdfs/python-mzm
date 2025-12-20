@@ -61,6 +61,10 @@ class DitherParams:
 class DeltaVPolicyNet(nn.Module):
     def __init__(self, in_dim: int = 7, hidden: int = 64, depth: int = 3):
         super().__init__()
+        self.in_dim = in_dim
+        self.hidden = hidden
+        self.depth = depth
+        
         layers: list[nn.Module] = []
         for i in range(depth):
             layers.append(nn.Linear(in_dim if i == 0 else hidden, hidden))
@@ -362,7 +366,11 @@ def save_model(
         "model_state": model.state_dict(),
         "mu": mu.astype(np.float32),
         "sigma": sigma.astype(np.float32),
-        "arch": {"in_dim": int(mu.shape[0])},
+        "arch": {
+            "in_dim": getattr(model, "in_dim", int(mu.shape[0])),
+            "hidden": getattr(model, "hidden", 64),
+            "depth": getattr(model, "depth", 3),
+        },
         "device_params": device_params.__dict__,
         "dither_params": dither_params.__dict__,
     }
@@ -371,10 +379,39 @@ def save_model(
 
 def load_model(path: str | Path) -> tuple[nn.Module, dict]:
     ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
-    model = DeltaVPolicyNet(in_dim=int(ckpt["arch"]["in_dim"]))
+    
+    # Infer architecture if not fully specified (backward compatibility)
+    arch = ckpt.get("arch", {})
+    in_dim = int(arch.get("in_dim", 7))
+    
+    state_dict = ckpt["model_state"]
+    
+    # Try to infer hidden and depth from state_dict if not in arch
+    if "hidden" not in arch or "depth" not in arch:
+        # Infer hidden from first layer weight: [hidden, in_dim]
+        if "net.0.weight" in state_dict:
+            hidden = state_dict["net.0.weight"].shape[0]
+        else:
+            hidden = 64 # Fallback
+            
+        # Infer depth from max layer index
+        max_idx = 0
+        for k in state_dict.keys():
+            if k.startswith("net."):
+                parts = k.split(".")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    idx = int(parts[1])
+                    if idx > max_idx:
+                        max_idx = idx
+        # Last layer index is 2*depth
+        depth = max_idx // 2
+    else:
+        hidden = int(arch["hidden"])
+        depth = int(arch["depth"])
+
+    model = DeltaVPolicyNet(in_dim=in_dim, hidden=hidden, depth=depth)
 
     # Fix for torch.compile prefix if model was saved from a compiled state
-    state_dict = ckpt["model_state"]
     new_state_dict = {}
     for k, v in state_dict.items():
         if k.startswith("_orig_mod."):
