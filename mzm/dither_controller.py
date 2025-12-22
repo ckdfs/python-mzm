@@ -1,14 +1,18 @@
 """Dither-based closed-loop MZM bias controller (reusable module).
 
 What this implements
-- You can ONLY observe PD low-frequency pilot (dither) 1f/2f power (dBm).
-- You do NOT use DC optical power.
+- You can ONLY observe PD low-frequency pilot (dither) 1f/2f power.
+- Features are normalized by DC photocurrent to handle optical power fluctuations.
 - You do NOT assume signed I/Q lock-in outputs.
 
 To recover direction (which is lost if you only use power magnitudes), the controller
 uses a *history finite difference* (more realistic than taking an extra probe sample):
-    x_k = [P1_dBm(k), P2_dBm(k), dP1_dBm, dP2_dBm, dV_{k-1}, sin(theta*), cos(theta*)]
-where dP*_dBm = P*_dBm(k) - P*_dBm(k-1).
+    x_k = [P1/pd_dc, P2/pd_dc, dP1_norm, dP2_norm, dV_{k-1}, sin(theta*), cos(theta*)]
+where dP*_norm = (P*/pd_dc)(k) - (P*/pd_dc)(k-1).
+
+DC Normalization: By dividing harmonic amplitudes by pd_dc (mean photocurrent),
+the features become robust against input optical power fluctuations (e.g., laser
+aging, fiber vibrations). This is critical for real-world deployment.
 
 The policy outputs an incremental update ΔV.
 Bias is clamped to [0, Vpi] so the target range is 0..180 degrees.
@@ -33,7 +37,7 @@ import torch
 from torch import nn
 
 from mzm.model import (
-    measure_pd_dither_1f2f_dbm_batch_torch,
+    measure_pd_dither_normalized_batch_torch,
     bias_to_theta_rad,
     theta_to_bias_V,
     wrap_to_pi,
@@ -148,14 +152,15 @@ def generate_dataset_dbm_hist(
         2: (torch.sin(2.0 * w * t), torch.cos(2.0 * w * t)),
     }
 
-    def _measure_dbm_torch(v_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        p1_out = np.empty((v_arr.size,), dtype=np.float32)
-        p2_out = np.empty((v_arr.size,), dtype=np.float32)
+    def _measure_normalized_torch(v_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Measure DC-normalized harmonic amplitudes (h1/pd_dc, h2/pd_dc)."""
+        h1_out = np.empty((v_arr.size,), dtype=np.float32)
+        h2_out = np.empty((v_arr.size,), dtype=np.float32)
         bs = int(max(1, torch_batch))
         for start in range(0, v_arr.size, bs):
             end = min(v_arr.size, start + bs)
             vb = torch.from_numpy(v_arr[start:end]).to(device=device, dtype=torch.float32)
-            p1b, p2b = measure_pd_dither_1f2f_dbm_batch_torch(
+            h1b, h2b, _ = measure_pd_dither_normalized_batch_torch(
                 V_bias=vb,
                 V_dither_amp=float(dither_params.V_dither_amp),
                 f_dither=float(dither_params.f_dither),
@@ -169,23 +174,23 @@ def generate_dataset_dbm_hist(
                 R_load=float(device_params.R_load),
                 refs=refs,
             )
-            p1_out[start:end] = p1b.detach().cpu().numpy()
-            p2_out[start:end] = p2b.detach().cpu().numpy()
-        return p1_out, p2_out
+            h1_out[start:end] = h1b.detach().cpu().numpy()
+            h2_out[start:end] = h2b.detach().cpu().numpy()
+        return h1_out, h2_out
 
-    p1, p2 = _measure_dbm_torch(V_bias)
-    p1_prev, p2_prev = _measure_dbm_torch(V_prev)
+    h1, h2 = _measure_normalized_torch(V_bias)
+    h1_prev, h2_prev = _measure_normalized_torch(V_prev)
 
-    dp1 = (p1 - p1_prev).astype(np.float32)
-    dp2 = (p2 - p2_prev).astype(np.float32)
+    dh1 = (h1 - h1_prev).astype(np.float32)
+    dh2 = (h2 - h2_prev).astype(np.float32)
     te = _target_encoding(theta_target.astype(np.float32))
 
     X = np.stack(
         [
-            p1.astype(np.float32),
-            p2.astype(np.float32),
-            dp1,
-            dp2,
+            h1.astype(np.float32),   # DC-normalized 1f amplitude
+            h2.astype(np.float32),   # DC-normalized 2f amplitude
+            dh1,                      # delta h1_norm
+            dh2,                      # delta h2_norm
             dv_prev.astype(np.float32),
             te[:, 0].astype(np.float32),
             te[:, 1].astype(np.float32),
@@ -487,22 +492,22 @@ def rollout_dbm_hist(
 
     V = float(np.clip(V_init, 0.0, Vpi))
 
-    prev_p1 = None
-    prev_p2 = None
+    prev_h1 = None
+    prev_h2 = None
     prev_dv = 0.0
 
     V_hist: list[float] = []
     err_deg_hist: list[float] = []
     dv_hist: list[float] = []
-    p1_hist: list[float] = []
-    p2_hist: list[float] = []
-    dp1_hist: list[float] = []
-    dp2_hist: list[float] = []
+    h1_hist: list[float] = []
+    h2_hist: list[float] = []
+    dh1_hist: list[float] = []
+    dh2_hist: list[float] = []
     theta_deg_hist: list[float] = []
 
     for _ in range(int(steps)):
         vb_t = torch.tensor([float(V)], device=device, dtype=torch.float32)
-        p1_t, p2_t = measure_pd_dither_1f2f_dbm_batch_torch(
+        h1_t, h2_t, _ = measure_pd_dither_normalized_batch_torch(
             V_bias=vb_t,
             V_dither_amp=float(dither_params.V_dither_amp),
             f_dither=float(dither_params.f_dither),
@@ -517,19 +522,19 @@ def rollout_dbm_hist(
             refs=refs,
         )
 
-        p1 = float(p1_t[0].item())
-        p2 = float(p2_t[0].item())
-        dp1 = 0.0 if prev_p1 is None else (p1 - float(prev_p1))
-        dp2 = 0.0 if prev_p2 is None else (p2 - float(prev_p2))
+        h1 = float(h1_t[0].item())
+        h2 = float(h2_t[0].item())
+        dh1 = 0.0 if prev_h1 is None else (h1 - float(prev_h1))
+        dh2 = 0.0 if prev_h2 is None else (h2 - float(prev_h2))
 
         te = _target_encoding(np.array([th_t], dtype=np.float32))[0]
-        x = np.array([p1, p2, dp1, dp2, float(prev_dv), float(te[0]), float(te[1])], dtype=np.float32)
+        x = np.array([h1, h2, dh1, dh2, float(prev_dv), float(te[0]), float(te[1])], dtype=np.float32)
         xn = (x - mu) / sigma
 
         dv = float(model(torch.from_numpy(xn).to(device).unsqueeze(0)).cpu().numpy().reshape(-1)[0])
         V = float(np.clip(V + dv, 0.0, Vpi))
 
-        prev_p1, prev_p2 = p1, p2
+        prev_h1, prev_h2 = h1, h2
         prev_dv = dv
 
         th_c = float(bias_to_theta_rad(V, Vpi_DC=device_params.Vpi_DC))
@@ -538,20 +543,20 @@ def rollout_dbm_hist(
         V_hist.append(V)
         err_deg_hist.append(float(np.rad2deg(err)))
         dv_hist.append(dv)
-        p1_hist.append(p1)
-        p2_hist.append(p2)
-        dp1_hist.append(dp1)
-        dp2_hist.append(dp2)
+        h1_hist.append(h1)
+        h2_hist.append(h2)
+        dh1_hist.append(dh1)
+        dh2_hist.append(dh2)
         theta_deg_hist.append(float(np.rad2deg(th_c)))
 
     return {
         "V": np.asarray(V_hist, dtype=float),
         "err_deg": np.asarray(err_deg_hist, dtype=float),
         "dv": np.asarray(dv_hist, dtype=float),
-        "p1_dBm": np.asarray(p1_hist, dtype=float),
-        "p2_dBm": np.asarray(p2_hist, dtype=float),
-        "dp1_dBm": np.asarray(dp1_hist, dtype=float),
-        "dp2_dBm": np.asarray(dp2_hist, dtype=float),
+        "h1_norm": np.asarray(h1_hist, dtype=float),
+        "h2_norm": np.asarray(h2_hist, dtype=float),
+        "dh1_norm": np.asarray(dh1_hist, dtype=float),
+        "dh2_norm": np.asarray(dh2_hist, dtype=float),
         "theta_deg": np.asarray(theta_deg_hist, dtype=float),
     }
 
@@ -618,8 +623,8 @@ def rollout_dbm_hist_batch(
     }
 
     # State initialization
-    prev_p1 = None
-    prev_p2 = None
+    prev_h1 = None
+    prev_h2 = None
     prev_dv = torch.zeros_like(V)
 
     # History storage (on CPU to save GPU memory if steps are large, or keep on GPU?)
@@ -632,8 +637,8 @@ def rollout_dbm_hist_batch(
     te_cos = torch.cos(th_t_rad)
 
     for _ in range(int(steps)):
-        # Measure
-        p1, p2 = measure_pd_dither_1f2f_dbm_batch_torch(
+        # Measure DC-normalized features
+        h1, h2, _ = measure_pd_dither_normalized_batch_torch(
             V_bias=V,
             V_dither_amp=float(dither_params.V_dither_amp),
             f_dither=float(dither_params.f_dither),
@@ -649,16 +654,16 @@ def rollout_dbm_hist_batch(
         )
 
         # Deltas
-        if prev_p1 is None:
-            dp1 = torch.zeros_like(p1)
-            dp2 = torch.zeros_like(p2)
+        if prev_h1 is None:
+            dh1 = torch.zeros_like(h1)
+            dh2 = torch.zeros_like(h2)
         else:
-            dp1 = p1 - prev_p1
-            dp2 = p2 - prev_p2
+            dh1 = h1 - prev_h1
+            dh2 = h2 - prev_h2
 
         # Construct input
-        # x: [p1, p2, dp1, dp2, prev_dv, sin(th), cos(th)]
-        x = torch.stack([p1, p2, dp1, dp2, prev_dv, te_sin, te_cos], dim=1)
+        # x: [h1, h2, dh1, dh2, prev_dv, sin(th), cos(th)]
+        x = torch.stack([h1, h2, dh1, dh2, prev_dv, te_sin, te_cos], dim=1)
         xn = (x - mu_t) / sigma_t
 
         # Inference
@@ -668,8 +673,8 @@ def rollout_dbm_hist_batch(
         V = torch.clamp(V + dv, 0.0, Vpi)
 
         # Update state
-        prev_p1 = p1
-        prev_p2 = p2
+        prev_h1 = h1
+        prev_h2 = h2
         prev_dv = dv
 
         # Calculate error for history

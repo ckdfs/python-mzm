@@ -584,3 +584,67 @@ def measure_pd_dither_1f2f_dbm_batch_torch(
         refs=refs,
     )
     return out["p1_dBm"].to(dtype=torch.float32), out["p2_dBm"].to(dtype=torch.float32)
+
+
+@torch.no_grad()
+def measure_pd_dither_normalized_batch_torch(
+    *,
+    V_bias: torch.Tensor,
+    V_dither_amp: float = 0.05,
+    f_dither: float = 50e3,
+    Fs: float = 5e6,
+    n_periods: int = 200,
+    Vpi_DC: float = 5.0,
+    ER_dB: float = 30.0,
+    IL_dB: float = 6.0,
+    Pin_dBm: float = 10.0,
+    Responsivity: float = 0.786,
+    R_load: float = 50.0,
+    refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Torch/GPU-accelerated batch version with DC-normalized outputs.
+
+    Computes DC-normalized 1f/2f amplitude features for a batch of bias voltages.
+    The normalization (h1_A/pd_dc, h2_A/pd_dc) makes features robust against
+    input optical power fluctuations (e.g., laser aging, fiber vibrations).
+
+    Parameters
+    - V_bias: 1D tensor of shape [B] (or any shape that flattens to B)
+    - refs: optional precomputed {harmonic: (sin_ref, cos_ref)} where each ref
+      has shape [N] on the same device as V_bias.
+
+    Returns
+    - h1_norm: tensor [B] - h1_A / pd_dc (dimensionless, normalized 1f amplitude)
+    - h2_norm: tensor [B] - h2_A / pd_dc (dimensionless, normalized 2f amplitude)
+    - pd_dc: tensor [B] - mean photocurrent (A), useful for diagnostics
+    """
+
+    out = _measure_pd_dither_1f2f_batch_torch(
+        V_bias=V_bias,
+        V_dither_amp=float(V_dither_amp),
+        f_dither=float(f_dither),
+        Fs=float(Fs),
+        n_periods=int(n_periods),
+        Vpi_DC=float(Vpi_DC),
+        ER_dB=float(ER_dB),
+        IL_dB=float(IL_dB),
+        Pin_dBm=float(Pin_dBm),
+        Responsivity=float(Responsivity),
+        R_load=float(R_load),
+        refs=refs,
+    )
+
+    pd_dc = out["pd_dc"]
+    h1_A = out["h1_A"]
+    h2_A = out["h2_A"]
+
+    # Normalize by DC photocurrent (add small epsilon to avoid division by zero)
+    eps = 1e-12
+    h1_norm = h1_A / (pd_dc + eps)
+    h2_norm = h2_A / (pd_dc + eps)
+
+    return (
+        h1_norm.to(dtype=torch.float32),
+        h2_norm.to(dtype=torch.float32),
+        pd_dc.to(dtype=torch.float32),
+    )
