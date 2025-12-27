@@ -217,3 +217,175 @@ def plot_bias_scan(sim: SimulationResult) -> None:
     plt.ylabel("Optical Power (mW)")
     plt.grid(True)
     plt.tight_layout()
+
+
+def plot_rollout_convergence(
+    err_deg: np.ndarray,
+    *,
+    target_deg: float | None = None,
+    rf_info: str = "",
+    title_prefix: str = "Closed-loop convergence",
+) -> None:
+    """Plot wrapped phase error over iterations for a single rollout.
+
+    Parameters
+    ----------
+    err_deg : array-like
+        Wrapped phase error trace in degrees (length = steps).
+    target_deg : float | None
+        Optional target label for the legend.
+    rf_info : str
+        Optional extra info appended to the title (e.g. "(RF: 200mV)" or "(no RF)").
+    """
+
+    e = np.asarray(err_deg, dtype=float)
+
+    plt.figure(figsize=(8, 4))
+    if target_deg is None:
+        plt.plot(e, label="error")
+    else:
+        plt.plot(e, label=f"target {float(target_deg):.0f}°")
+    plt.axhline(0.0, color="k", linewidth=1)
+    plt.xlabel("Iteration")
+    plt.ylabel("Phase Error (deg, wrapped)")
+    title = title_prefix
+    if rf_info:
+        title += str(rf_info)
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+
+def plot_target_sweep_stats(
+    current_stats: dict | None,
+    best_stats: dict | None = None,
+    *,
+    rf_info: str = "",
+    current_color: str = "blue",
+    best_color: str = "orange",
+) -> None:
+    """Plot mean absolute error vs target angle with ±1 std shading.
+
+    Expects stats dicts with keys: 'targets', 'mean', 'std'.
+    """
+
+    plt.figure(figsize=(12, 6))
+
+    def _plot_one(stats: dict, color: str, label_prefix: str) -> None:
+        t = np.asarray(stats["targets"], dtype=float)
+        m = np.asarray(stats["mean"], dtype=float)
+        s = np.asarray(stats["std"], dtype=float)
+
+        plt.plot(t, m, color=color, label=f"{label_prefix} Mean MAE", linewidth=2)
+        lower = np.maximum(m - s, 0.0)
+        plt.fill_between(t, lower, m + s, color=color, alpha=0.2, label=f"{label_prefix} ±1 Std")
+
+    if current_stats is not None:
+        _plot_one(current_stats, current_color, "Current")
+
+    if best_stats is not None:
+        _plot_one(best_stats, best_color, "Best")
+
+    plt.xlabel("Target Angle (deg)")
+    plt.ylabel("Absolute Error (deg)")
+    plt.title(f"Model Evaluation: Error Distribution vs Target Angle (0-180°){rf_info}")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+
+def plot_rf_power_robustness_curve(results: dict | None, *, title_suffix: str = "") -> None:
+    """Plot mean±std absolute error vs RF amplitude.
+
+    Expects results dict keys: 'V_rf_amp_values', 'mean_errors', 'std_errors', 'f_rf'.
+    """
+
+    if results is None:
+        raise ValueError("results is None")
+
+    V_rf = np.asarray(results["V_rf_amp_values"], dtype=float)
+    means = np.asarray(results["mean_errors"], dtype=float)
+    stds = np.asarray(results["std_errors"], dtype=float)
+    f_rf_ghz = float(results.get("f_rf", 1e9)) / 1e9
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(V_rf, means, "b-o", linewidth=2, markersize=8, label="Mean Error")
+    ax.fill_between(V_rf, np.maximum(means - stds, 0.0), means + stds, alpha=0.2, color="blue", label="±1 Std")
+    ax.axvline(x=0.0, color="r", linestyle="--", alpha=0.7, label="Training (no RF)")
+    ax.set_xlabel("RF Signal Amplitude (V)")
+    ax.set_ylabel("Absolute Error (deg)")
+    ax.set_title(f"RF Power Robustness Test @ {f_rf_ghz:.1f} GHz {title_suffix}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+
+def plot_rf_robustness_heatmap(results: dict | None) -> None:
+    """Plot RF robustness heatmap and per-angle curves.
+
+    Expects results keys: 'V_rf_amp_values', 'target_angles', 'mean_errors', 'f_rf'.
+    """
+
+    if results is None:
+        raise ValueError("results is None")
+
+    V_rf = np.asarray(results["V_rf_amp_values"], dtype=float)
+    angles = np.asarray(results["target_angles"], dtype=float)
+    means = np.asarray(results["mean_errors"], dtype=float)
+    f_rf_ghz = float(results.get("f_rf", 1e9)) / 1e9
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    im1 = ax1.imshow(means, aspect="auto", cmap="RdYlGn_r", origin="lower")
+    ax1.set_xticks(range(len(angles)))
+    ax1.set_xticklabels([f"{int(a)}°" if float(a).is_integer() else f"{a:.1f}°" for a in angles])
+    ax1.set_yticks(range(len(V_rf)))
+    ax1.set_yticklabels([f"{v*1000:.0f}mV" for v in V_rf])
+    ax1.set_xlabel("Target Angle")
+    ax1.set_ylabel("RF Amplitude")
+    ax1.set_title(f"Mean Error (deg) vs RF Power & Target Angle @ {f_rf_ghz:.1f} GHz")
+    plt.colorbar(im1, ax=ax1, label="Mean Error (deg)")
+
+    for i in range(len(V_rf)):
+        for j in range(len(angles)):
+            ax1.text(j, i, f"{means[i, j]:.2f}", ha="center", va="center", color="black", fontsize=9)
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(angles)))
+    for j, (angle, color) in enumerate(zip(angles, colors)):
+        ax2.plot(V_rf * 1000.0, means[:, j], "o-", color=color, label=f"{int(angle)}°" if float(angle).is_integer() else f"{angle:.1f}°", linewidth=2)
+
+    ax2.axvline(x=0.0, color="gray", linestyle="--", alpha=0.7, label="Training (no RF)")
+    ax2.set_xlabel("RF Amplitude (mV)")
+    ax2.set_ylabel("Mean Error (deg)")
+    ax2.set_title(f"Error vs RF Power for Different Target Angles @ {f_rf_ghz:.1f} GHz")
+    ax2.legend(loc="upper left")
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+
+def plot_optical_power_robustness_curve(results: dict | None, *, title_suffix: str = "") -> None:
+    """Plot mean±std absolute error vs input optical power (Pin in dBm).
+
+    Expects results keys: 'Pin_dBm_values', 'mean_errors', 'std_errors', 'training_Pin_dBm'.
+    """
+
+    if results is None:
+        raise ValueError("results is None")
+
+    Pin = np.asarray(results["Pin_dBm_values"], dtype=float)
+    means = np.asarray(results["mean_errors"], dtype=float)
+    stds = np.asarray(results["std_errors"], dtype=float)
+    training_Pin = float(results["training_Pin_dBm"])
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.plot(Pin, means, "b-o", linewidth=2, markersize=8, label="Mean Error")
+    ax.fill_between(Pin, np.maximum(means - stds, 0.0), means + stds, alpha=0.2, color="blue", label="±1 Std")
+    ax.axvline(x=training_Pin, color="r", linestyle="--", alpha=0.7, label=f"Training ({training_Pin:.0f} dBm)")
+    ax.set_xlabel("Input Optical Power (dBm)")
+    ax.set_ylabel("Absolute Error (deg)")
+    ax.set_title(f"Optical Power Robustness Test {title_suffix}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()

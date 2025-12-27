@@ -7,9 +7,14 @@
 项目采用如下关键约束（与代码实现保持一致）：
 
 - 可观测量：只能测得 PD 低频导频信号的 **一阶（1f）与二阶（2f）谐波**。
-- 特征形式：使用 **功率幅度（dBm）**，不使用锁相后的带符号 I/Q 作为控制输入。
+- 特征形式：使用 **DC 归一化的电流幅度 (H/Idc)**，不使用锁相后的带符号 I/Q，也不使用 Power dBm（以消除光功率波动影响）。
 - 目标范围：只要求角度 $\theta$ 在 $0^\circ\sim 180^\circ$（对应半周期），即偏置电压约束在 $V\in[0,V_\pi]$。
 - 控制输出：策略输出偏置电压增量 $\Delta V$，并在每次更新后执行电压限幅（clamp）以满足硬件可行区间。
+
+补充（鲁棒性评估设定）：
+
+- 控制器**不需要观测高速 RF**，但在仿真评估/数据集生成时，可选择在偏置上叠加高速 RF 正弦项作为“外部干扰”，用于测试策略在 RF 调制存在时的鲁棒性。
+- RF 干扰鲁棒性测试中，**导频（dither）的幅度与频率必须保持不变**；鲁棒性来自策略与特征的设计，而不是通过改变导频注入来“适配”环境。
 
 对应代码入口：
 
@@ -198,6 +203,84 @@ $$
 - `p1_W, p2_W`：功率（W）
 - `p1_dBm, p2_dBm`：功率（dBm）
 
+### 3.5 $H_1, H_2$ 的严格定义公式
+
+为了消除歧义，本项目中 $H_1, H_2$ 指的是 **PD 输出电流中相应频率分量的“幅度（Magnitude）”**，单位为安培（A）。
+
+其计算公式完全基于上述数字锁相逻辑：
+
+$$
+H_k \triangleq \sqrt{I_k^2 + Q_k^2}
+$$
+
+其中 $I_k, Q_k$ 为第 $k$ 阶谐波的同相与正交分量积分值：
+
+$$
+I_k = \frac{2}{N}\sum_{n=0}^{N-1} (I[n]-I_{DC})\sin(k\Omega n),\quad
+Q_k = \frac{2}{N}\sum_{n=0}^{N-1} (I[n]-I_{DC})\cos(k\Omega n)
+$$
+
+其中 $I_{DC}$ 定义为采样窗口内 PD 光电流的**时间平均值**（即直流分量）：
+
+$$
+I_{DC} \triangleq \frac{1}{N}\sum_{n=0}^{N-1} I[n]
+$$
+
+**归一化特征**则定义为：
+
+$$
+\tilde{H}_k \triangleq \frac{H_k}{I_{DC}}
+$$
+
+这是送入神经网络的实际物理量（无量纲）。
+
+### 3.6 噪声与噪底（代码实现路径）
+
+本仓库中“噪声/噪底”的实现分两条路径：
+
+1) **频谱演示路径（`simulate_mzm()`）**：用于生成带噪底的 PD 输出电谱（便于对照频谱仪/FFT 单次谱观测），会显式计算并注入噪声功率。
+
+2) **控制器观测路径（`measure_pd_dither_*()` / lock-in）**：用于生成控制器输入特征 $\tilde{H}_1,\tilde{H}_2$。当前实现为**理想 lock-in 提取**（不注入 thermal/shot/RIN 的随机噪声），因此训练/回放中的 dither 特征不会随噪底起伏。
+
+为避免歧义，下述公式与术语以 `mzm/model.py` 的实现为准。
+
+#### 3.6.1 噪声功率的计算：按 RBW 积分
+
+在 `simulate_mzm()` 中，首先得到平均光电流 $I_{\text{av}}$，然后计算三类噪声在分辨率带宽 $\mathrm{RBW}$ 内对应的**等效噪声功率**（单位 W）：
+
+- **热噪声（Johnson-Nyquist）**：
+  $$P_{\text{thermal}} = kT\cdot \mathrm{RBW}$$
+- **散粒子噪声（Shot）**：
+  $$P_{\text{shot}} = (2q I_{\text{av}})\cdot R_{\text{load}}\cdot \mathrm{RBW}$$
+- **相对强度噪声（RIN）**（其中 $\mathrm{RIN}_{\text{lin}}=10^{\mathrm{RIN}_{\text{dB/Hz}}/10}$）：
+  $$P_{\text{rin}} = \mathrm{RIN}_{\text{lin}}\cdot I_{\text{av}}^2\cdot R_{\text{load}}\cdot \mathrm{RBW}$$
+
+总噪声功率为：
+$$P_{\text{noise}} = P_{\text{thermal}} + P_{\text{shot}} + P_{\text{rin}}.$$
+
+同时给出噪声功率谱密度（dBm/Hz）：
+$$P_{\text{density}}=\frac{P_{\text{noise}}}{\mathrm{RBW}}.$$
+
+#### 3.6.2 噪底如何“进入频谱”：对每个 FFT bin 叠加随机噪声功率
+
+`simulate_mzm()` 并不是在时域电流 $I_{PD}(t)$ 上叠加高斯噪声，而是在计算电谱后对每个频点（FFT bin）生成一份随机噪声功率并相加：
+
+- 先由 FFT 得到每个频点的信号功率 $P_{\text{sig}}[k]$（单位 W）。
+- 再生成随机噪声功率 $P_{\text{n}}[k]$，其均值为 $P_{\text{noise}}$，用于模拟单次频谱观测的起伏。
+- 最终频点功率：
+  $$P_{\text{total}}[k]=P_{\text{sig}}[k]+P_{\text{n}}[k].$$
+
+绘图函数 `plot_electrical_spectrum()` 里画出的“噪底虚线”来自：
+$$P_{\text{floor,dBm}} = P_{\text{density,dBm/Hz}} + 10\log_{10}(\mathrm{RBW}).$$
+
+#### 3.6.3 与控制器输入的关系（重要）
+
+控制器输入特征 $\tilde{H}_1,\tilde{H}_2$ 来自 dither 的 lock-in 幅度提取（`_measure_pd_dither_1f2f_batch_torch()` 及其包装函数）。这条路径目前不包含 thermal/shot/RIN 的随机噪声注入。
+
+因此：
+- 文档中涉及“噪底/噪声功率/噪声谱密度”的描述，默认指**频谱演示**（`simulate_mzm()`）口径；
+- 若要评估“导频观测在噪声下的鲁棒性”，需要后续在时域或 lock-in 输出端加入等效噪声（例如按 $2qI$、RIN 与 $kT$ 推导输出方差）。
+
 ---
 
 ## 4. 闭环控制问题表述
@@ -205,14 +288,14 @@ $$
 ### 4.1 状态、观测与控制量
 
 - 真正需要控制的状态：偏置电压 $V$（或等价的工作角度 $\theta$）。
-- 可观测量：$P_1^{\text{dBm}},P_2^{\text{dBm}}$（由 PD 导频 1f/2f 提取）。
+- 可观测量：$H_1, H_2$ 的归一化幅度（由 PD 导频 1f/2f 提取并除以 DC）。
 - 控制量：每步更新 $\Delta V$，并执行
 
 $$
 V_{k+1}=\mathrm{clip}(V_k+\Delta V_k,\ 0,\ V_\pi).
 $$
 
-该限幅策略与 `mzm/dither_controller.py` 的 `rollout_dbm_hist()` 实现一致。
+该限幅策略与 `mzm/dither_controller.py` 的 `rollout_dbm_hist()` 实现一致（注：函数名保留了 `dbm` 是为了兼容旧版命名，实际内部已切换为 `normalized` 特征）。
 
 ### 4.2 目标角度的编码
 
@@ -258,15 +341,15 @@ $$
 A_1\ge 0
 $$
 
-符号被消除，导致仅靠当前时刻 $(P_1,P_2)$ 不能确定“该向哪个方向调偏置”。
+符号被消除，导致仅靠当前时刻 $(H_1,H_2)$ 不能确定“该向哪个方向调偏置”。
 
 ### 5.2 使用差分信息恢复方向信息
 
 本项目采用“历史一致”的差分方式恢复方向信息：若控制器在上一拍输出了 $\Delta V_{k-1}$，那么当前观测与上一观测之间的差分
 
 $$
-\Delta P_{1,k} = P_{1,k}-P_{1,k-1},\quad
-\Delta P_{2,k} = P_{2,k}-P_{2,k-1}
+\Delta \tilde{H}_{1,k} = \tilde{H}_{1,k}-\tilde{H}_{1,k-1},\quad
+\Delta \tilde{H}_{2,k} = \tilde{H}_{2,k}-\tilde{H}_{2,k-1}
 $$
 
 在统计意义上携带了局部梯度方向信息（结合已知的上一拍动作方向 $\Delta V_{k-1}$）。
@@ -274,10 +357,10 @@ $$
 因此策略的输入向量定义为（与 `mzm/dither_controller.py` 完全一致）：
 
 $$
-\mathbf{x}_k=[P_{1,k}^{\text{dBm}},\ P_{2,k}^{\text{dBm}},\ \Delta P_{1,k}^{\text{dBm}},\ \Delta P_{2,k}^{\text{dBm}},\ \Delta V_{k-1},\ \sin\theta^*,\ \cos\theta^*].
+\mathbf{x}_k=[\tilde{H}_{1,k},\ \tilde{H}_{2,k},\ \Delta \tilde{H}_{1,k},\ \Delta \tilde{H}_{2,k},\ \Delta V_{k-1},\ \sin\theta^*,\ \cos\theta^*].
 $$
 
-输入维度为 7。
+其中 $\tilde{H} = H/I_{DC}$ 为归一化幅度。输入维度为 7。
 
 ---
 
@@ -445,20 +528,20 @@ $$
 
 #### 7.1.3 差分特征 $dp1,dp2$ 的来源
 
-导频测量函数 `measure_pd_dither_1f2f()` 返回 1f/2f 的功率幅度（dBm）：
-
-$$
-P_{1,k}^{\mathrm{dBm}},\ P_{2,k}^{\mathrm{dBm}}.
-$$
-
-差分特征按两拍观测差分定义：
-
-$$
-dp1 = P_{1,k}^{\mathrm{dBm}}-P_{1,k-1}^{\mathrm{dBm}},\quad
-dp2 = P_{2,k}^{\mathrm{dBm}}-P_{2,k-1}^{\mathrm{dBm}}.
-$$
-
-代码实现中，$P_{1,k-1}^{\mathrm{dBm}},P_{2,k-1}^{\mathrm{dBm}}$ 来自对 $V_{k-1}$ 的一次测量，$P_{1,k}^{\mathrm{dBm}},P_{2,k}^{\mathrm{dBm}}$ 来自对 $V_k$ 的一次测量，因此差分对应“系统经历上一拍动作后观测发生的变化”。
+导频测量函数 `measure_pd_dither_normalized_batch_torch()` 返回 1f/2f 的归一化幅度：
+ 
+ $$
+ \tilde{H}_{1,k},\ \tilde{H}_{2,k}.
+ $$
+ 
+ 差分特征按两拍观测差分定义：
+ 
+ $$
+ \Delta \tilde{H}_{1} = \tilde{H}_{1,k}-\tilde{H}_{1,k-1},\quad
+ \Delta \tilde{H}_{2} = \tilde{H}_{2,k}-\tilde{H}_{2,k-1}.
+ $$
+ 
+ 代码实现中，$\tilde{H}_{1,k-1}$ 等来自对 $V_{k-1}$ 的一次测量，$\tilde{H}_{1,k}$ 来自对 $V_k$ 的一次测量，因此差分对应“系统经历上一拍动作后观测发生的变化”。
 
 #### 7.1.4 目标角度 $\theta^*$ 的编码
 
@@ -477,10 +560,10 @@ $$
 ### 7.2 输入特征与标签的最终形式（与实现一致）
 
 对每个样本，拼接得到 7 维输入：
-
-$$
-\mathbf{x}_k=[P_{1,k}^{\text{dBm}},\ P_{2,k}^{\text{dBm}},\ dp1,\ dp2,\ \Delta V_{k-1},\ \sin\theta^*,\ \cos\theta^*].
-$$
+ 
+ $$
+ \mathbf{x}_k=[\tilde{H}_{1,k},\ \tilde{H}_{2,k},\ \Delta \tilde{H}_{1},\ \Delta \tilde{H}_{2},\ \Delta V_{k-1},\ \sin\theta^*,\ \cos\theta^*].
+ $$
 
 监督标签 $y$（教师输出）为当前拍建议的更新量 $\Delta V_k$（见第 6.3 节）。
 
@@ -597,44 +680,44 @@ $$
 回放过程可以用以下变量描述：
 
 - 状态：$V_k$（偏置电压，限制在 $[0,V_\pi]$）
-- 观测：$(P_{1,k}^{\mathrm{dBm}},P_{2,k}^{\mathrm{dBm}})$（由导频测量得到）
-- 历史：上一拍观测 $(P_{1,k-1}^{\mathrm{dBm}},P_{2,k-1}^{\mathrm{dBm}})$ 与上一拍动作 $\Delta V_{k-1}$
-- 动作：$\Delta V_k$（策略网络输出）
+ - 观测：$(\tilde{H}_{1,k},\tilde{H}_{2,k})$（由导频测量并 DC 归一化得到）
+ - 历史：上一拍观测 $(\tilde{H}_{1,k-1},\tilde{H}_{2,k-1})$ 与上一拍动作 $\Delta V_{k-1}$
+ - 动作：$\Delta V_k$（策略网络输出）
 
 每一拍的更新（与实现一致）可写为：
 
-1) 测量：$P_{1,k}^{\mathrm{dBm}},P_{2,k}^{\mathrm{dBm}} \leftarrow \text{measure}(V_k)$
-
-2) 构造差分：
-
-$$
-dp1_k=P_{1,k}^{\mathrm{dBm}}-P_{1,k-1}^{\mathrm{dBm}},\quad
-dp2_k=P_{2,k}^{\mathrm{dBm}}-P_{2,k-1}^{\mathrm{dBm}}
-$$
-
-3) 组装并标准化输入：
-
-$$
-\hat{\mathbf{x}}_k = \frac{[P_{1,k}^{\mathrm{dBm}},P_{2,k}^{\mathrm{dBm}},dp1_k,dp2_k,\Delta V_{k-1},\sin\theta^*,\cos\theta^*]-\mu}{\sigma}
-$$
-
-4) 策略输出与限幅：
-
-$$
-\Delta V_k = \pi_\psi(\hat{\mathbf{x}}_k),\quad
-V_{k+1}=\mathrm{clip}(V_k+\Delta V_k,0,V_\pi)
-$$
-
-5) 误差记录：$e_k=\mathrm{wrap}(\theta^*-\theta(V_k))$。
+1) 测量：$\tilde{H}_{1,k},\tilde{H}_{2,k} \leftarrow \text{measure\_normalized}(V_k)$
+ 
+ 2) 构造差分：
+ 
+ $$
+ \Delta \tilde{H}_{1,k}=\tilde{H}_{1,k}-\tilde{H}_{1,k-1},\quad
+ \Delta \tilde{H}_{2,k}=\tilde{H}_{2,k}-\tilde{H}_{2,k-1}
+ $$
+ 
+ 3) 组装并标准化输入：
+ 
+ $$
+ \hat{\mathbf{x}}_k = \frac{[\tilde{H}_{1,k},\tilde{H}_{2,k},\Delta \tilde{H}_{1,k},\Delta \tilde{H}_{2,k},\Delta V_{k-1},\sin\theta^*,\cos\theta^*]-\mu}{\sigma}
+ $$
+ 
+ 4) 策略输出与限幅：
+ 
+ $$
+ \Delta V_k = \pi_\psi(\hat{\mathbf{x}}_k),\quad
+ V_{k+1}=\mathrm{clip}(V_k+\Delta V_k,0,V_\pi)
+ $$
+ 
+ 5) 误差记录：$e_k=\mathrm{wrap}(\theta^*-\theta(V_k))$。
 
 ### 9.2 回放返回的 trace 字段（用于逐轮展示）
 
 为支持逐轮过程打印与调试，当前实现除 `V/err_deg` 外，还返回：
 
 - `dv`：每轮策略输出的 $\Delta V_k$
-- `p1_dBm, p2_dBm`：每轮观测到的导频 1f/2f 功率（dBm）
-- `dp1_dBm, dp2_dBm`：每轮观测差分
-- `theta_deg`：每轮偏置对应的角度（度）
+ - `h1_norm, h2_norm`：每轮观测到的归一化 1f/2f 幅度
+ - `dh1_norm, dh2_norm`：每轮观测差分
+ - `theta_deg`：每轮偏置对应的角度（度）
 
 Notebook 入口 `mzm_dither_controller.ipynb` 默认以“单目标角度”方式运行，并打印上述 trace 以便审阅每轮推理过程。
 
@@ -661,6 +744,59 @@ Notebook 中新增了完整的评估流水线：
    - 若当前模型更优，则自动覆盖保存为最佳模型，并缓存评估结果（`.npz`），避免重复计算。
 
 ---
+
+## 10+. 物理扰动鲁棒性测试（RF / 光功率）
+
+本节记录 Notebook 中新增的两类“物理扰动”鲁棒性评估：
+
+1) **高速 RF 干扰**：在偏置电压上叠加 1 GHz 量级 RF 正弦项，控制器仍然只基于导频 1f/2f 特征闭环。
+
+2) **输入光功率变化**：扫描 $P_{in}$（以 `Pin_dBm` 表示），验证在光功率漂移/衰减时的稳定性。
+
+### 10+.1 RF 干扰鲁棒性（不改变 dither）
+
+实现路径：在批量回放/评估接口中引入 RF 参数：
+
+- `V_rf_amp`：RF 正弦幅度（单位 V）。
+- `f_rf`：RF 频率（单位 Hz），默认 1e9（1 GHz）。
+
+Notebook 提供三个开关（仅改变“环境中是否叠加 RF”，不改变 dither）：
+
+- `ENABLE_RF_TRAINING`：训练数据生成/训练时是否叠加 RF。
+- `ENABLE_RF_INFERENCE`：推理/回放时是否叠加 RF。
+- `ENABLE_RF_EVALUATION`：批量评估/对比时是否叠加 RF。
+
+#### RF 电压与 dBm 换算（可选）
+
+若将 `V_rf_amp` 视为**正弦峰值电压** $V_{\text{peak}}$，并假设 50 Ω 负载，则
+
+$$
+V_{\mathrm{rms}}=\frac{V_{\text{peak}}}{\sqrt{2}},\quad
+P=\frac{V_{\mathrm{rms}}^2}{R},\quad
+P_{\mathrm{dBm}}=10\log_{10}\left(\frac{P}{1\,\mathrm{mW}}\right)
+$$
+
+在 $R=50\,\Omega$ 下，`V_rf_amp=0.2 Vpeak` 对应 $V_{\mathrm{rms}}\approx 0.141\,\mathrm{V}$，功率 $P\approx 0.4\,\mathrm{mW}$，约为 **-4 dBm**。
+
+注意：若工程上使用的是 $V_{pp}$ 或 $V_{rms}$ 表达，请相应换算后再对照 dBm。
+
+#### 训练注意事项（经验结论）
+
+若训练时始终使用固定的 `V_rf_amp`（且始终开启 RF），可能出现对特定 RF 干扰“适配过度”，从而在 **无 RF** 场景下评估性能反而退化。更稳健的做法通常是：
+
+- 训练时混合“无 RF / 有 RF”样本（例如以一定概率令 `V_rf_amp=0`）；
+- 有 RF 的样本中对 `V_rf_amp` 做随机化（必要时也可对 `f_rf` 做小范围扰动）。
+
+### 10+.2 输入光功率变化鲁棒性（Pin_dBm 扫描）
+
+实现路径：批量回放接口支持 `Pin_dBm` 覆盖（用于评估时扫描，不需要修改 `device_params`）：
+
+- `Pin_dBm=None`：默认使用 `device_params.Pin_dBm`。
+- `Pin_dBm=<float>`：在本次 rollout 中强制使用指定输入光功率（dBm）。
+
+理论上 DC 归一化特征 $H/I_{DC}$ 对 $P_{in}$ 的整体缩放具有不变性，但在包含噪声（RIN/shot/thermal）或量化误差时，依然建议用上述扫描做回归测试，确保 MAE 在不同光功率下保持稳定。
+
+注：当前仓库的默认数据集/回放实现中，dither 的 lock-in 特征为理想提取（不含 thermal/shot/RIN 的随机噪声）。上述“包含噪声”更偏向真实硬件场景或未来扩展（见 3.6 节）。
 
 ## 11. 针对 0 度死区的优化策略
 
@@ -723,6 +859,12 @@ requirements.txt 包含最小依赖：
 - `Responsivity`：A/W，默认 0.786
 - `p1_dBm`/`p2_dBm`：dBm，按 $P_{\text{avg}}=(A^2/2)R$ 计算
 
+鲁棒性评估新增参数：
+
+- `V_rf_amp`：伏特（V），RF 正弦幅度（默认 0.0，表示无 RF）；文档默认将其理解为 $V_{\text{peak}}$
+- `f_rf`：赫兹（Hz），RF 频率（默认 1 GHz）
+- `Pin_dBm`：dBm，输入光功率；评估接口允许覆盖以扫描光功率变化
+
 ---
 
 ## 14. 局限性
@@ -752,3 +894,46 @@ requirements.txt 包含最小依赖：
 
 - `mzm_dither_controller.ipynb`
   - 将上述函数组织为可复用流水线
+
+---
+
+## 16. 项目演进与优化历程 (Project Evolution)
+
+本项目经过了多轮深入的迭代与重构，以下是基于开发历史的关键节点总结：
+
+### 16.1 第一阶段：基础架构构建
+*   **物理引擎**：实现了基于 Jacobi-Anger 展开的 MZM 传输模型；其中 `simulate_mzm()` 的电谱演示路径支持热/散粒/RIN 噪底计算与注入（dither lock-in 特征路径当前为理想提取）。
+*   **初步控制**：验证了 PID 只能锁定特定点（Null/Peak），确立了基于深度学习的任意点锁定目标。
+*   **计算加速**：引入 PyTorch 替代 NumPy 进行物理仿真，利用 CUDA/MPS 并行计算导频响应，将数据集生成速度提升 50 倍以上。
+
+### 16.2 第二阶段：稳定性与平台适配
+*   **跨平台支持**：适配 Apple Silicon (MPS) 加速，解决了 float32 精度在不同后端上的数值差异问题。
+*   **训练稳定化**：引入 `ReduceLROnPlateau` 学习率调度器，解决了训练后期的 Loss 震荡问题。
+
+### 16.3 第三阶段：物理鲁棒性攻关 (关键)
+*   **光功率解耦**：早期模型使用 dBm 绝对值作为输入，导致激光器功率波动时模型失效。引入 **DC 归一化 ($H/I_{DC}$)** 后，彻底消除了 $P_{in}$ 波动对控制策略的影响。
+*   **方向性恢复**：确认了仅幅度观测导致的方向模糊问题，确立了“历史差分输入”方案，成功在不使用相干解调的情况下恢复了梯度方向信息。
+
+### 16.4 第四阶段：精度极限突破
+*   **死区消除**：针对 0 度/180 度极值点 1f 信号消失的问题，扩充了 3 倍的边界样本，并加宽网络（64->128），最终实现全角度 $\mathrm{MAE} < 0.5^\circ$。
+
+---
+
+## 17. 嵌入式部署可行性分析 (STM32)
+
+针对目标硬件 **STM32F446RET6** (ARM Cortex-M4 @ 180MHz) 的部署评估：
+
+### 17.1 存储需求
+*   **模型参数**：约 34k 个参数。
+*   **Flash 占用**：
+    *   FP32: ~136 KB (STM32F446 512KB Flash -> **占用 26%**)
+    *   Int8 量化: ~34 KB (**占用 6%**)
+*   **结论**：无需裁剪即可完整容纳。
+
+### 17.2 算力需求
+*   **单次推理**：约 68k FLOPs。
+*   **耗时预估**：
+    *   DSP 指令优化后，Cortex-M4 约需 0.5~1.0 ms 完成一次推理。
+    *   加上 ADC 采集与 lock-in 预处理（数字积分），总回路延迟可控制在 2ms 以内。
+*   **实时性**：支持 $> 100 \text{Hz}$ 的控制更新率，远高于 MZM 热漂移带宽（通常 < 1Hz），满足实时控制要求。
+

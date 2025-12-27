@@ -330,11 +330,23 @@ def _measure_pd_dither_1f2f_batch_torch(
     Responsivity: float,
     R_load: float,
     refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    # RF signal parameters (optional, for robustness testing)
+    V_rf_amp: float = 0.0,
+    f_rf: float = 1e9,
 ) -> dict[str, torch.Tensor]:
     """Torch batch core for PD dither 1f/2f measurement.
 
     Returns tensors with batch dimension [B]. Internal math uses float64
     for stability (especially when 2f is extremely small).
+    
+    Parameters
+    ----------
+    V_rf_amp : float, optional
+        RF signal amplitude (V). Default 0.0 (no RF signal).
+        When > 0, a high-frequency RF signal is added to simulate
+        real-world conditions where data modulation coexists with dither.
+    f_rf : float, optional
+        RF signal frequency (Hz). Default 1e9 (1 GHz).
     """
 
     if f_dither <= 0 or Fs <= 0:
@@ -353,7 +365,16 @@ def _measure_pd_dither_1f2f_batch_torch(
     t = torch.arange(n_samples, device=device, dtype=dtype) / float(Fs)
     w1 = 2.0 * float(np.pi) * float(f_dither)
     dither = float(V_dither_amp) * torch.sin(w1 * t)  # [N]
-    V_t = Vb[:, None] + dither[None, :]  # [B, N]
+    
+    # Add RF signal if specified (high-frequency modulation)
+    # Note: For realistic simulation, RF frequency >> dither frequency
+    # The RF signal adds perturbation to the optical power, affecting dither measurement
+    if float(V_rf_amp) > 0:
+        w_rf = 2.0 * float(np.pi) * float(f_rf)
+        rf_signal = float(V_rf_amp) * torch.sin(w_rf * t)  # [N]
+        V_t = Vb[:, None] + dither[None, :] + rf_signal[None, :]  # [B, N]
+    else:
+        V_t = Vb[:, None] + dither[None, :]  # [B, N]
 
     # DC transfer (same as mzm_dc_power_mW) in torch
     Pin_W = 10.0 ** ((float(Pin_dBm) - 30.0) / 10.0)
@@ -554,6 +575,8 @@ def measure_pd_dither_1f2f_dbm_batch_torch(
     Responsivity: float = 0.786,
     R_load: float = 50.0,
     refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    V_rf_amp: float = 0.0,
+    f_rf: float = 1e9,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Torch/GPU-accelerated batch version of dither measurement.
 
@@ -563,6 +586,8 @@ def measure_pd_dither_1f2f_dbm_batch_torch(
     - V_bias: 1D tensor of shape [B] (or any shape that flattens to B)
     - refs: optional precomputed {harmonic: (sin_ref, cos_ref)} where each ref
       has shape [N] on the same device as V_bias.
+    - V_rf_amp: RF signal amplitude (V). Default 0.0 (no RF).
+    - f_rf: RF signal frequency (Hz). Default 1e9 (1 GHz).
 
     Returns
     - p1_dBm: tensor [B]
@@ -582,6 +607,8 @@ def measure_pd_dither_1f2f_dbm_batch_torch(
         Responsivity=float(Responsivity),
         R_load=float(R_load),
         refs=refs,
+        V_rf_amp=float(V_rf_amp),
+        f_rf=float(f_rf),
     )
     return out["p1_dBm"].to(dtype=torch.float32), out["p2_dBm"].to(dtype=torch.float32)
 
@@ -601,6 +628,8 @@ def measure_pd_dither_normalized_batch_torch(
     Responsivity: float = 0.786,
     R_load: float = 50.0,
     refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+    V_rf_amp: float = 0.0,
+    f_rf: float = 1e9,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Torch/GPU-accelerated batch version with DC-normalized outputs.
 
@@ -612,6 +641,8 @@ def measure_pd_dither_normalized_batch_torch(
     - V_bias: 1D tensor of shape [B] (or any shape that flattens to B)
     - refs: optional precomputed {harmonic: (sin_ref, cos_ref)} where each ref
       has shape [N] on the same device as V_bias.
+    - V_rf_amp: RF signal amplitude (V). Default 0.0 (no RF).
+    - f_rf: RF signal frequency (Hz). Default 1e9 (1 GHz).
 
     Returns
     - h1_norm: tensor [B] - h1_A / pd_dc (dimensionless, normalized 1f amplitude)
@@ -632,6 +663,8 @@ def measure_pd_dither_normalized_batch_torch(
         Responsivity=float(Responsivity),
         R_load=float(R_load),
         refs=refs,
+        V_rf_amp=float(V_rf_amp),
+        f_rf=float(f_rf),
     )
 
     pd_dc = out["pd_dc"]

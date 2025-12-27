@@ -95,8 +95,19 @@ def generate_dataset_dbm_hist(
     max_step_V: float = 0.2,
     accel: str = "auto",
     torch_batch: int = 512,
+    V_rf_amp: float = 0.0,
+    f_rf: float = 1e9,
 ) -> dict:
     """Generate supervised dataset for realistic dbm_hist controller.
+
+    Parameters
+    ----------
+    V_rf_amp : float, optional
+        RF signal amplitude (V) to include during training. Default 0.0 (no RF).
+        Set to a positive value (e.g., 0.2) to train the model with RF interference,
+        which can improve robustness to RF power variations during inference.
+    f_rf : float, optional
+        RF signal frequency (Hz). Default 1e9 (1 GHz).
 
     Returns a dict containing Xn, y, and normalization stats.
     """
@@ -140,6 +151,10 @@ def generate_dataset_dbm_hist(
             device = torch.device("cpu")
 
     print(f"generate_dataset_dbm_hist using device: {device}")
+    if V_rf_amp > 0:
+        print(f"  RF training enabled: V_rf_amp={V_rf_amp:.3f} V, f_rf={f_rf/1e9:.1f} GHz")
+    else:
+        print(f"  RF training disabled (V_rf_amp=0)")
 
     # Precompute lock-in references once per call, on the selected device.
     n_samples_time = int(
@@ -173,6 +188,8 @@ def generate_dataset_dbm_hist(
                 Responsivity=float(device_params.Responsivity),
                 R_load=float(device_params.R_load),
                 refs=refs,
+                V_rf_amp=float(V_rf_amp),
+                f_rf=float(f_rf),
             )
             h1_out[start:end] = h1b.detach().cpu().numpy()
             h2_out[start:end] = h2b.detach().cpu().numpy()
@@ -218,6 +235,8 @@ def generate_dataset_dbm_hist(
         "dither_params": dither_params,
         "teacher_gain": float(teacher_gain),
         "max_step_V": float(max_step_V),
+        "V_rf_amp": float(V_rf_amp),
+        "f_rf": float(f_rf),
     }
 
 
@@ -235,6 +254,8 @@ def save_dataset(dataset: dict, path: str | Path) -> None:
         dither_params=np.array(list(dataset["dither_params"].__dict__.items()), dtype=object),
         teacher_gain=np.array(dataset["teacher_gain"], dtype=np.float32),
         max_step_V=np.array(dataset["max_step_V"], dtype=np.float32),
+        V_rf_amp=np.array(dataset.get("V_rf_amp", 0.0), dtype=np.float32),
+        f_rf=np.array(dataset.get("f_rf", 1e9), dtype=np.float32),
     )
 
 
@@ -243,6 +264,10 @@ def load_dataset(path: str | Path) -> dict:
 
     device_params = DeviceParams(**dict(z["device_params"]))
     dither_params = DitherParams(**dict(z["dither_params"]))
+
+    # Load RF parameters (with backward compatibility for old datasets)
+    V_rf_amp = float(z["V_rf_amp"]) if "V_rf_amp" in z.files else 0.0
+    f_rf = float(z["f_rf"]) if "f_rf" in z.files else 1e9
 
     return {
         "Xn": z["Xn"].astype(np.float32),
@@ -253,6 +278,8 @@ def load_dataset(path: str | Path) -> dict:
         "dither_params": dither_params,
         "teacher_gain": float(z["teacher_gain"]),
         "max_step_V": float(z["max_step_V"]),
+        "V_rf_amp": V_rf_amp,
+        "f_rf": f_rf,
     }
 
 
@@ -448,7 +475,18 @@ def rollout_dbm_hist(
     V_init: float,
     steps: int = 60,
     accel: str = "auto",
+    V_rf_amp: float = 0.0,
+    f_rf: float = 1e9,
 ) -> dict:
+    """Single-trajectory rollout with optional RF signal.
+    
+    Parameters
+    ----------
+    V_rf_amp : float, optional
+        RF signal amplitude (V). Default 0.0 (no RF signal).
+    f_rf : float, optional
+        RF signal frequency (Hz). Default 1e9 (1 GHz).
+    """
     accel_norm = str(accel).lower().strip()
     if accel_norm not in {"cpu", "auto", "cuda", "mps"}:
         raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda', 'mps'")
@@ -520,6 +558,8 @@ def rollout_dbm_hist(
             Responsivity=float(device_params.Responsivity),
             R_load=float(device_params.R_load),
             refs=refs,
+            V_rf_amp=float(V_rf_amp),
+            f_rf=float(f_rf),
         )
 
         h1 = float(h1_t[0].item())
@@ -573,7 +613,23 @@ def rollout_dbm_hist_batch(
     V_init: np.ndarray,
     steps: int = 60,
     accel: str = "auto",
+    V_rf_amp: float = 0.0,
+    f_rf: float = 1e9,
+    Pin_dBm: float | None = None,
 ) -> dict:
+    """Batch rollout with optional RF signal and optical power override for robustness testing.
+    
+    Parameters
+    ----------
+    V_rf_amp : float, optional
+        RF signal amplitude (V). Default 0.0 (no RF signal).
+        Use this to test model robustness under RF modulation.
+    f_rf : float, optional
+        RF signal frequency (Hz). Default 1e9 (1 GHz).
+    Pin_dBm : float, optional
+        Input optical power (dBm). If None, uses device_params.Pin_dBm.
+        Use this to test model robustness under optical power fluctuations.
+    """
     accel_norm = str(accel).lower().strip()
     if accel_norm not in {"cpu", "auto", "cuda", "mps"}:
         raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda', 'mps'")
@@ -598,7 +654,7 @@ def rollout_dbm_hist_batch(
         else:
             device = torch.device("cpu")
 
-    print(f"rollout_dbm_hist_batch using device: {device}")
+    # print(f"rollout_dbm_hist_batch using device: {device}")
 
     model = model.to(device)
 
@@ -636,6 +692,9 @@ def rollout_dbm_hist_batch(
     te_sin = torch.sin(th_t_rad)
     te_cos = torch.cos(th_t_rad)
 
+    # Use provided Pin_dBm or default from device_params
+    actual_Pin_dBm = Pin_dBm if Pin_dBm is not None else float(device_params.Pin_dBm)
+
     for _ in range(int(steps)):
         # Measure DC-normalized features
         h1, h2, _ = measure_pd_dither_normalized_batch_torch(
@@ -647,10 +706,12 @@ def rollout_dbm_hist_batch(
             Vpi_DC=float(device_params.Vpi_DC),
             ER_dB=float(device_params.ER_dB),
             IL_dB=float(device_params.IL_dB),
-            Pin_dBm=float(device_params.Pin_dBm),
+            Pin_dBm=actual_Pin_dBm,
             Responsivity=float(device_params.Responsivity),
             R_load=float(device_params.R_load),
             refs=refs,
+            V_rf_amp=float(V_rf_amp),
+            f_rf=float(f_rf),
         )
 
         # Deltas
