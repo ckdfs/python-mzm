@@ -14,6 +14,9 @@
 补充（鲁棒性评估设定）：
 
 - 控制器**不需要观测高速 RF**，但在仿真评估/数据集生成时，可选择在偏置上叠加高速 RF 正弦项作为“外部干扰”，用于测试策略在 RF 调制存在时的鲁棒性。
+- **RF 干扰建模更新 (2025-12-30)**：
+    - 摒弃了早期的“随机相位/采样混叠”模拟方法（该方法会引入非物理的随机噪声）。
+    - 采用**解析解缩放 (Analytical Scaling)**：利用 Bessel 函数 $J_0(\beta)$ 对干涉项进行缩放。这准确反映了高速 RF 调制导致低频导频信号灵敏度下降的物理本质，消除了人为噪声带来的控制震荡。
 - RF 干扰鲁棒性测试中，**导频（dither）的幅度与频率必须保持不变**；鲁棒性来自策略与特征的设计，而不是通过改变导频注入来“适配”环境。
 
 对应代码入口：
@@ -45,11 +48,30 @@ $$
 
 其中：
 
-- $\eta=10^{-\mathrm{IL}/10}$ 为插入损耗（IL, dB）对应的功率衰减因子；
-- $\gamma$ 为消光比相关的幅度不平衡系数。若消光比以场比定义为 $\mathrm{ER}_{\text{field}}=10^{\mathrm{ER}_{\text{dB}}/20}$，则
+- $\eta$ 为插入损耗（Insertion Loss, IL）对应的功率传输因子。若定义 IL (dB) 为器件最大透过率相对于输入功率的损耗（正值）：
 
 $$
-\gamma = \frac{\mathrm{ER}_{\text{field}}-1}{\mathrm{ER}_{\text{field}}+1}.
+\mathrm{IL}_{\text{dB}} = -10 \log_{10}\left(\frac{P_{\text{out},\max}}{P_{\text{in}}}\right)
+$$
+
+则功率传输因子为 $\eta = 10^{-\mathrm{IL}/10}$。由于光功率与光场幅度的平方成正比（$P \propto |E|^2$），功率衰减因子 $\eta$ 对应到场幅度上即为 $\sqrt{\eta}$。
+
+- $\gamma$ 为消光比相关的幅度不平衡系数。本项目中 `ER_dB` 定义为**功率消光比**（Power Extinction Ratio）的分贝值：
+
+$$
+\mathrm{ER}_{\text{dB}} = 10 \log_{10}\left(\frac{P_{\max}}{P_{\min}}\right)
+$$
+
+对应的**场消光比**（Field Extinction Ratio）为：
+
+$$
+\mathrm{ER}_{\text{field}} = \frac{|E_{\max}|}{|E_{\min}|} = \sqrt{\frac{P_{\max}}{P_{\min}}} = 10^{\mathrm{ER}_{\text{dB}}/20}
+$$
+
+由此推导不平衡系数 $\gamma$（假设两臂幅度分别为 $1$ 和 $\gamma$）：
+
+$$
+\frac{1+\gamma}{1-\gamma} = \mathrm{ER}_{\text{field}} \implies \gamma = \frac{\mathrm{ER}_{\text{field}}-1}{\mathrm{ER}_{\text{field}}+1}
 $$
 
 这与 `simulate_mzm()` 内部变量 gamma 的计算一致。
@@ -80,6 +102,20 @@ $$
 $$
 P_{\text{out}}=|E_{\text{out}}|^2.
 $$
+
+### 2.3 高速 RF 调制下的平均功率模型 (RF Modulation Effect)
+
+当 MZM 上同时存在低频偏置 $V_{bias}$ 和高速 RF 数据信号 $V_{RF}\sin(\omega_{RF}t)$ 时，由于光电探测器（PD）带宽远低于 RF 频率，PD 输出响应的是 RF 周期内的**平均光功率**。
+
+根据 Jacobi-Anger 展开，高速调制对低频传输曲线的影响表现为干涉项的缩放：
+
+$$
+P_{avg}(V_{bias}) \propto 1 + \gamma^2 + 2\gamma \cdot \underbrace{J_0\left(\frac{\pi V_{RF}}{V_\pi}\right)}_{\text{RF Scaling Factor}} \cdot \cos\left(\frac{\pi V_{bias}}{V_\pi}\right)
+$$
+
+其中 $J_0(\cdot)$ 是第一类零阶 Bessel 函数。
+*   **物理意义**：RF 信号的存在会降低 MZM 传输曲线的对比度（消光比看似下降），导致导频信号（$H_1, H_2$）的幅度整体衰减。
+*   **仿真实现**：在 `mzm/model.py` 中，我们直接计算该 $J_0$ 因子并应用到功率公式中，从而精确模拟 RF 干扰对控制回路的影响，避免了时域采样混叠带来的误差。
 
 代码中 `mzm_dc_power_mW()` 实现的就是上述 DC 传输曲线，返回单位为 mW。
 

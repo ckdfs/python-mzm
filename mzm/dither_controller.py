@@ -295,7 +295,8 @@ def train_policy(
     seed: int = 0,
     accel: str = "auto",
 ) -> nn.Module:
-    torch.manual_seed(seed)
+    if seed is not None:
+        torch.manual_seed(seed)
 
     accel_norm = str(accel).lower().strip()
     if accel_norm not in {"cpu", "auto", "cuda", "mps"}:

@@ -152,17 +152,19 @@ def _annotate_rf_orders(f_cpu: np.ndarray, p_cpu: np.ndarray, f_rf_hz: float, or
 
         x_mhz = peak_f / 1e6
         plt.scatter(x_mhz, peak_p, color=color, s=20, zorder=3)
+        
+        label = f"DC\n{peak_p:.1f} dBm" if n == 0 else f"{n}×RF\n{peak_p:.1f} dBm"
         plt.text(
             x_mhz,
             peak_p + 2,
-            f"{n}×RF\n{peak_p:.1f} dBm",
+            label,
             ha="center",
             va="bottom",
             fontsize=8,
         )
 
 
-def plot_electrical_spectrum(sim: SimulationResult, f_rf_hz: float = 1e9, harmonic_orders=(1, 2)) -> None:
+def plot_electrical_spectrum(sim: SimulationResult, f_rf_hz: float = 1e9, harmonic_orders=(0, 1, 2)) -> None:
     """Plot electrical spectrum at PD output, with noise floor and RF harmonics.
 
     Uses the electrical spectrum and noise information already computed in
@@ -197,7 +199,7 @@ def plot_electrical_spectrum(sim: SimulationResult, f_rf_hz: float = 1e9, harmon
     plt.title("Electrical Spectrum at PD Output")
     plt.grid(True, linestyle="--", alpha=0.7)
     if p_plot.size:
-        plt.ylim(bottom=-160, top=float(np.max(p_plot)) + 10)
+        plt.ylim(bottom=-160, top=float(np.max(p_plot)) + 15)
 
     _annotate_rf_orders(f_plot, p_plot, f_rf_hz, orders=harmonic_orders)
 
@@ -312,7 +314,7 @@ def plot_rf_power_robustness_curve(results: dict | None, *, title_suffix: str = 
     fig, ax = plt.subplots(figsize=(7, 5))
     ax.plot(V_rf, means, "b-o", linewidth=2, markersize=8, label="Mean Error")
     ax.fill_between(V_rf, np.maximum(means - stds, 0.0), means + stds, alpha=0.2, color="blue", label="±1 Std")
-    ax.axvline(x=0.0, color="r", linestyle="--", alpha=0.7, label="Training (no RF)")
+    # ax.axvline(x=0.0, color="r", linestyle="--", alpha=0.7, label="Training (no RF)")
     ax.set_xlabel("RF Signal Amplitude (V)")
     ax.set_ylabel("Absolute Error (deg)")
     ax.set_title(f"RF Power Robustness Test @ {f_rf_ghz:.1f} GHz {title_suffix}")
@@ -355,7 +357,7 @@ def plot_rf_robustness_heatmap(results: dict | None) -> None:
     for j, (angle, color) in enumerate(zip(angles, colors)):
         ax2.plot(V_rf * 1000.0, means[:, j], "o-", color=color, label=f"{int(angle)}°" if float(angle).is_integer() else f"{angle:.1f}°", linewidth=2)
 
-    ax2.axvline(x=0.0, color="gray", linestyle="--", alpha=0.7, label="Training (no RF)")
+    # ax2.axvline(x=0.0, color="gray", linestyle="--", alpha=0.7, label="Training (no RF)")
     ax2.set_xlabel("RF Amplitude (mV)")
     ax2.set_ylabel("Mean Error (deg)")
     ax2.set_title(f"Error vs RF Power for Different Target Angles @ {f_rf_ghz:.1f} GHz")

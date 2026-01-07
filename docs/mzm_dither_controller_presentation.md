@@ -27,6 +27,53 @@
     *   **任意点锁定**：只需改变输入中的“目标指令”，无需调整控制律结构。
     *   **端到端**：直接从物理观测量映射到控制动作，无需中间显式求解复杂方程。
 
+### 1.4 深度学习开发与部署流程 (Development & Deployment Workflow)
+本项目的开发流程分为**仿真验证**和**实物部署**两个阶段。仿真阶段用于验证网络结构和控制逻辑的可行性，实物阶段则利用真实数据训练最终的控制器。
+
+#### 流程示意图 (Workflow Diagram)
+
+```mermaid
+graph LR
+    %% 阶段一：仿真验证
+    subgraph Phase1 ["阶段一：仿真验证 (Simulation Verification)"]
+        direction TB
+        PyModel[Python 物理模型] -->|生成虚拟数据| SimData[仿真数据集]
+        SimData -->|训练| Net_Arch_Sim[神经网络架构]
+        Net_Arch_Sim -->|验证收敛性| Sim_Result[可行性验证]
+    end
+
+    %% 阶段二：实物部署
+    subgraph Phase2 ["阶段二：实物实验与部署 (Experiment & Deployment)"]
+        direction TB
+        Real_MZM[真实 MZM 系统] -->|扫描/采集| RealData[实测数据集]
+        RealData -->|重新训练| Net_Arch_Real[神经网络架构]
+        Net_Arch_Real -->|生成权重| Final_Model[最终模型权重]
+        Final_Model -->|加载| Controller[实时控制器]
+        Controller -->|闭环控制| Real_MZM
+    end
+
+    %% 跨阶段连接 (架构复用)
+    Net_Arch_Sim -.->|架构复用| Net_Arch_Real
+    
+    style Phase1 fill:#f9f2f4,stroke:#d63384,stroke-width:2px
+    style Phase2 fill:#e7f5ff,stroke:#0d6efd,stroke-width:2px
+```
+
+#### 关键步骤说明
+
+1.  **仿真验证 (Simulation Verification)**：
+    *   **目的**：在低成本环境下快速验证神经网络架构（层数、节点数）和输入特征（谐波组合）的有效性。
+    *   **过程**：利用 `mzm/model.py` 生成包含各种漂移情况的虚拟数据集，训练网络并观察其是否能准确预测偏置误差。
+    *   **产出**：确定的网络超参数和预处理流程。
+
+2.  **实物数据采集 (Real Data Collection)**：
+    *   **目的**：获取真实器件的响应特性（包含实际的噪声分布、驱动器非线性等仿真难以完美覆盖的因素）。
+    *   **过程**：对真实 MZM 进行偏置电压扫描，记录对应的谐波功率，构建实测数据集。
+
+3.  **模型重训与部署 (Retraining & Deployment)**：
+    *   **策略**：**丢弃仿真数据**，仅使用实测数据对同样的网络架构进行重新训练。
+    *   **优势**：确保模型完全适配当前物理系统的特性，消除“仿真-现实差距 (Sim-to-Real Gap)”。
+
 ---
 
 ## 2. 物理原理与数学模型 (Physical Principles & Mathematical Model)
@@ -34,7 +81,16 @@
 ### 2.1 MZM 传输函数 (MZM Transfer Function)
 基于 `mzm/model.py` 中的物理模型，双臂 MZM 的光场输出 $E_{out}$ 为两臂光场的干涉叠加：
 
-$$ E_{out} = \frac{E_{in}}{2} \sqrt{\eta_{IL}} \left[ e^{j \phi_1(V)} + \gamma e^{j \phi_2(V)} \right] $$
+$$ E_{out} = \underbrace{\frac{1}{\sqrt{2}} \cdot \frac{1}{\sqrt{2}}}_{\text{Splitter \& Combiner}} E_{in} \sqrt{\eta_{IL}} \left[ e^{j \phi_1(V)} + \gamma e^{j \phi_2(V)} \right] = \frac{E_{in}}{2} \sqrt{\eta_{IL}} \left[ e^{j \phi_1(V)} + \gamma e^{j \phi_2(V)} \right] $$
+
+**系数 $\frac{1}{4}$ 的物理来源**：
+*   **分束 (Splitter)**：输入光经过第一个 3dB 耦合器，能量平分，场强变为 $1/\sqrt{2}$。
+*   **合束 (Combiner)**：两臂光经过第二个 3dB 耦合器汇合，场强再次乘以 $1/\sqrt{2}$。
+    *   **为什么合束也要除以 $\sqrt{2}$？**
+    *   如果合束器只是简单相加 ($E_1+E_2$)，在同相干涉时，场强变为 $2 \times \frac{1}{\sqrt{2}} = \sqrt{2}$，功率变为 2 倍输入功率，**违反能量守恒**。
+    *   物理上，合束器将两路光投影到单模输出波导上。同相分量耦合进波导（归一化系数 $1/\sqrt{2}$），反相分量辐射到衬底损耗掉。
+*   **总效应**：总场强衰减系数为 $1/2$，因此功率传输系数为 $(1/2)^2 = 1/4$。
+    *   *注：当两臂完全相长干涉（Peak点）时，括号内项为 $(1+1)=2$，平方后为 4，与前面的 $1/4$ 抵消，实现 $P_{out} \approx P_{in}$（能量守恒）。*
 
 其中：
 *   $E_{in}$：输入光场。
@@ -43,12 +99,33 @@ $$ E_{out} = \frac{E_{in}}{2} \sqrt{\eta_{IL}} \left[ e^{j \phi_1(V)} + \gamma e
 *   $\phi_1, \phi_2$：两臂的相位调制量。在 Push-Pull 模式下：
     $$ \phi_1(V) = \frac{\pi}{V_{\pi}} \frac{V}{2}, \quad \phi_2(V) = -\frac{\pi}{V_{\pi}} \frac{V}{2} $$
 
-最终的光功率传输曲线（Intensity Transfer Function）为：
+**推导光功率传输曲线**：
+$$
+\begin{aligned}
+P_{out} &= |E_{out}|^2 = \frac{|E_{in}|^2}{4} \eta_{IL} \left| e^{j \phi_1} + \gamma e^{j \phi_2} \right|^2 \\
+&= \frac{P_{in}}{4} \eta_{IL} \left[ 1 + \gamma^2 + 2\gamma \cos(\phi_1 - \phi_2) \right]
+\end{aligned}
+$$
+令相位差 $\Delta \phi = \phi_1 - \phi_2 = \frac{\pi V}{V_\pi}$，并利用 $\cos(\Delta \phi) = 2\cos^2(\frac{\Delta \phi}{2}) - 1$，可得：
 
-$$ P_{out}(V) = |E_{out}|^2 \propto \cos^2\left(\frac{\pi V}{2 V_{\pi}} + \theta_{drift}\right) $$
+$$ P_{out}(V) = \frac{P_{in}}{4} \eta_{IL} \left[ (1-\gamma)^2 + 4\gamma \cos^2\left(\frac{\pi V}{2 V_{\pi}} + \theta_{drift}\right) \right] $$
 
-我们定义统一的**偏置相位** $\theta$ 来描述工作状态：
-$$ \theta \triangleq \frac{\pi}{V_{\pi}} V_{bias} $$
+**变量定义与物理含义辨析**：
+
+为了消除歧义，我们严格区分以下相位概念：
+
+1.  **单臂光相位 ($\phi_1, \phi_2$)**：光波在 MZM 两个干涉臂中传播积累的相位。
+2.  **总相位差 ($\Delta \phi$)**：两臂之间的总相位差，直接决定干涉强度。
+    $$ \Delta \phi = \phi_1 - \phi_2 = \theta + \Delta \phi_{drift} $$
+    它由**控制相位**和**漂移相位**两部分叠加而成。
+3.  **控制相位 ($\theta$)**：特指由偏置电压 $V$ 引入的那部分相位差。
+    $$ \theta \triangleq \frac{\pi V}{V_\pi} $$
+    这是控制器的直接操作对象（$0 \sim \pi$ 对应 $0 \sim V_\pi$）。
+4.  **传输函数参数**：MZM 传输函数取决于半相位差 $\frac{\Delta \phi}{2}$。
+    $$ \text{Argument} = \frac{\Delta \phi}{2} = \underbrace{\frac{\theta}{2}}_{\frac{\pi V}{2 V_\pi}} + \underbrace{\frac{\Delta \phi_{drift}}{2}}_{\theta_{drift}} $$
+    *   **注意**：公式中的 $\theta_{drift}$ 实际上代表环境引入的**半相位漂移**。
+    *   **控制目标**：调整 $\theta$ 使得总参数 $\frac{\theta}{2} + \theta_{drift}$ 落在特定工作点（如 $\frac{\pi}{2}$ 对应 Quad 点）。
+
 *   $\theta=0$：最大传输点 (Peak)
 *   $\theta=\pi/2$：正交点 (Quad)
 *   $\theta=\pi$：最小传输点 (Null)
@@ -166,16 +243,63 @@ $$ y = \sigma(\sum_{i} w_i x_i + b) $$
 ### 5.1 面向控制的特征工程 (Feature Engineering for Control)
 之所以选择这 7 个特征，是因为它们共同构成了一个**可观测的马尔可夫状态 (Observable Markov State)**。
 
-| 特征分组 | 变量名 | 物理含义 | 解决的痛点 |
-| :--- | :--- | :--- | :--- |
-| **观测态** | $\tilde{H}_1, \tilde{H}_2$ | 归一化后的 1f/2f 谐波 | 消除激光器功率 $P_{in}$ 波动产生的缩放干扰，实现**光功率解耦**。 |
-| **动态态** | $\Delta \tilde{H}_1, \Delta \tilde{H}_2$ | 当前观测 - 上一观测 | 仅凭单点幅度无法判断曲线的“左坡/右坡”。差分量结合上一动作，恢复了**方向信息**。 |
-| **动作态** | $\Delta V_{prev}$ | 上一拍施加的电压步长 | 告诉网络“刚才往哪个方向走了多远”，结合动态态，推断当前位置。 |
-| **指令态** | $\sin\theta^*, \cos\theta^*$ | 目标角度的嵌入 | 将离散的指令转化为连续的可微变量，使单一模型能学会**任意角度锁定**。 |
+**什么是马尔可夫性质 (Markov Property)？**
+一个系统的状态 $S_t$ 如果包含了决策下一步所需的所有信息（即“未来仅取决于当前，与过去无关”），则称该状态具有马尔可夫性。
+$$ P(S_{t+1} | S_t, S_{t-1}, \dots) = P(S_{t+1} | S_t) $$
 
-注：特征定义的关键在于 **DC归一化**。
-$$ \tilde{H}_k \triangleq \frac{H_k}{I_{DC}} $$
-这也意味着我们完全抛弃了“绝对功率(dBm)”作为特征，从而使控制策略对激光器功率 $P_{in}$ 的波动免疫。
+**为什么仅凭观测 ($H_1, H_2$) 是不够的？**
+*   **位置模糊**：由于传输函数的周期性和对称性，不同的相位点（如 $\theta$ 和 $-\theta$）可能产生完全相同的谐波幅值。
+*   **方向缺失**：仅凭一张静态的“快照”($H_1, H_2$)，无法判断当前是在“左坡”还是“右坡”。控制器不知道“刚才增加电压是让情况变好了还是变坏了”。
+
+**我们的特征如何构建马尔可夫状态？**
+我们构造的特征向量 $S_t = [\tilde{H}, \Delta \tilde{H}, \Delta V_{prev}, \text{Target}]$ 补全了缺失的**动态信息**：
+
+| 特征分组 | 变量名 | 物理含义 | 对马尔可夫性的贡献 |
+| :--- | :--- | :--- | :--- |
+| **观测态** | $\tilde{H}_1, \tilde{H}_2$ | 归一化后的 1f/2f 谐波 | 提供**位置信息**（离极值点有多远）。 |
+| **动态态** | $\Delta \tilde{H}_1, \Delta \tilde{H}_2$ | 当前观测 - 上一观测 | 提供**变化趋势**。结合上一动作，可以推断斜率符号。 |
+| **动作态** | $\Delta V_{prev}$ | 上一拍施加的电压步长 | 提供**因果参考**。告诉网络“刚才往哪个方向走了多远”。 |
+| **指令态** | $\sin\theta^*, \cos\theta^*$ | 目标角度的嵌入 | 提供**目标参考**。将目标融入状态，使策略通用化。 |
+
+**逻辑闭环与周期性**：
+通过组合 **“当前在哪里”($\tilde{H}$)** + **“刚才做了什么”($\Delta V$)** + **“结果变了多少”($\Delta \tilde{H}$)**，神经网络就能唯一确定当前在 **$2\pi$ 周期内的相位位置**和梯度方向。
+
+*   **关于周期性**：必须指出，这组特征**无法**区分 $\theta$ 和 $\theta + 2\pi$（即无法区分第 N 个周期和第 N+1 个周期）。
+*   **但这正是优势**：MZM 的物理特性决定了 $V$ 和 $V+2V_\pi$ 是完全等价的工作点。特征的周期性使得控制器能够自动适应任意 $2\pi$ 周期，实现**无限范围的相位锁定**，而不会被局限在特定的电压区间内。这使得我们不需要使用复杂的递归网络（如 LSTM/RNN），仅用轻量级的 MLP 就能实现最优控制。
+
+注：特征定义的关键在于 **DC 归一化 (DC Normalization)**，更准确地说，是提取 **调制深度 (Modulation Depth)** 或 **AC/DC 比率**。
+
+**为什么能免疫光功率波动？基于 Jacobi-Anger 展开的严格推导**：
+
+回顾 2.1 节推导的传输函数（令 $P_{scale} = \frac{P_{in}}{4}\eta_{IL}$）：
+$$ P_{out}(t) = P_{scale} \left[ (1+\gamma^2) + 2\gamma \cos(\Delta \phi(t)) \right] $$
+
+当施加导频信号时，总相位差为 $\Delta \phi(t) = \theta + m \sin(\omega_d t)$（$m$ 为调制指数）。利用三角恒等式展开余弦项：
+$$ \cos(\theta + m \sin(\omega_d t)) = \cos\theta \cos(m \sin(\omega_d t)) - \sin\theta \sin(m \sin(\omega_d t)) $$
+
+引入 **Jacobi-Anger 展开**：
+$$
+\begin{aligned}
+\cos(m \sin(\omega_d t)) &= J_0(m) + 2J_2(m)\cos(2\omega_d t) + \dots \\
+\sin(m \sin(\omega_d t)) &= 2J_1(m)\sin(\omega_d t) + 2J_3(m)\sin(3\omega_d t) + \dots
+\end{aligned}
+$$
+
+代回原式，可分离出各频率分量（假设光电转换系数 $\mathfrak{R}$）：
+
+1.  **直流分量 ($I_{DC}$)**：
+    $$ I_{DC} = \mathfrak{R} P_{scale} \left[ (1+\gamma^2) + 2\gamma J_0(m) \cos\theta \right] $$
+2.  **一阶谐波 ($H_1$)**：对应 $\sin(\omega_d t)$ 项系数
+    $$ H_1 = \mathfrak{R} P_{scale} \cdot 2\gamma \sin\theta \cdot 2J_1(m) = 4\gamma \mathfrak{R} P_{scale} J_1(m) \sin\theta $$
+3.  **二阶谐波 ($H_2$)**：对应 $\cos(2\omega_d t)$ 项系数
+    $$ H_2 = \mathfrak{R} P_{scale} \cdot 2\gamma \cos\theta \cdot 2J_2(m) = 4\gamma \mathfrak{R} P_{scale} J_2(m) \cos\theta $$
+
+**执行归一化操作**：
+$$ \tilde{H}_1 = \frac{H_1}{I_{DC}} = \frac{4\gamma \bcancel{\mathfrak{R} P_{scale}} J_1(m) \sin\theta}{\bcancel{\mathfrak{R} P_{scale}} [(1+\gamma^2) + 2\gamma J_0(m) \cos\theta]} $$
+
+**结论**：
+可以看到，包含光功率 $P_{in}$ 的公因子 $\mathfrak{R} P_{scale}$ 在分子分母中被**完美约分**。
+最终得到的特征 $\tilde{H}_1, \tilde{H}_2$ 仅是偏置相位 $\theta$、调制指数 $m$ 和器件参数 $\gamma$ 的函数，与激光器功率完全无关。
 
 ### 5.2 神经网络架构 (Neural Network Architecture)
 这是一个专门为嵌入式控制优化的轻量级全连接网络 (MLP)。
@@ -250,6 +374,7 @@ graph LR
 
 ### 6.1 数据集生成 (`generate_dataset_dbm_hist`)
 为了覆盖所有可能的工作状态，我们采用**随机游走 (Random Walk)** 策略生成数据，而非简单的网格扫描。
+*   **随机性保证**：代码中已将随机种子设为 `seed=None`，确保每次生成的数据集轨迹和训练初始化权重都具有真实的随机性，避免对特定伪随机序列过拟合。
 *   **随机轨迹**：模拟偏置电压 $V(t)$ 在 $[0, V_\pi]$ 范围内随机跳变。为了保证数据的物理自洽性，我们采用**反向构造法**生成历史状态 $V_{prev}$：
     $$ V_{prev}=\mathrm{clip}(V_{curr}-\Delta V_{rand},\ 0,\ V_\pi) $$
     这样确保了“上一动作 $\Delta V_{rand}$”确实能从 $V_{prev}$ 到达 $V_{curr}$，使得差分特征具有真实的物理意义。
@@ -291,8 +416,9 @@ graph LR
 *   **光功率不敏感**：由于采用了 $I_{DC}$ 归一化，策略对激光器功率波动在一阶上解耦。
 *   **方向歧义消除**：历史差分特征成功解决了仅凭幅度无法判断调节方向的问题，未出现“反向调节”或“震荡”现象。
 *   **死区克服**：通过特定优化，在 Null/Peak 点（1f 消失点），网络能够利用 2f 信息和历史趋势保持控制能力，未陷入死区。
-*   **新增：RF 干扰鲁棒性**：在偏置上叠加 1 GHz RF 正弦项（控制器不可观测 RF），扫描 `V_rf_amp` 评估性能退化。
-    *   50Ω 且 `V_rf_amp` 视为 $V_{peak}$ 时：0.2 Vpeak 约对应 -4 dBm（用于量级对照）。
+*   **新增：RF 干扰鲁棒性**：
+    *   **物理模型更新**：采用 Bessel 函数 $J_0(\beta)$ 缩放干涉项，精确模拟高速 RF 调制导致的导频灵敏度下降，消除了早期随机噪声模型带来的非物理震荡。
+    *   **测试结果**：在叠加 1 GHz RF 正弦信号（幅度 $0 \sim 0.5 V$）的情况下，控制器仍能保持稳定锁定，仅稳态误差随 RF 功率增加而轻微上升（符合信噪比下降的物理规律）。
 *   **新增：光功率扫描回归**：批量评估支持覆盖 `Pin_dBm`，对多档输入光功率（例如 0–15 dBm）扫描并对比 MAE。
 *   **训练提示**：若训练始终开启且固定 RF 幅度，可能对“无 RF”场景产生性能退化；更稳健做法是混合无 RF/有 RF 并随机化 `V_rf_amp`。
 

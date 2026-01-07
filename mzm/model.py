@@ -70,10 +70,16 @@ def simulate_mzm(
     f_rf: float = 1e9,
     V_rf_amp: float = 0.2,
     V_bias: float | None = None,
+    vpi_compatible_dbm: bool = False,
 ) -> SimulationResult:
     """Run MZM simulation with noise and spectrum analysis.
 
     Parameters mirror the original MATLAB script defaults.
+    
+    Args:
+        vpi_compatible_dbm: If True (default), electrical power is calculated as I^2 (normalized to 1 Ohm)
+                            to match VPI's default behavior, which is ~17 dB lower than I^2 * 50.
+                            If False, power is calculated as I^2 * R_load (physical power in 50 Ohm).
     """
 
     # 1. Time and basic parameters
@@ -125,16 +131,27 @@ def simulate_mzm(
     P_rin_W = (10.0 ** (RIN_dB_Hz / 10.0)) * (I_av ** 2) * R_load * RBW_Hz
 
     P_noise_total_W = P_thermal_W + P_shot_W + P_rin_W
-    P_noise_floor_dBm = 10.0 * np.log10(P_noise_total_W * 1000.0 + 1e-30)
 
-    P_density_W_Hz = P_noise_total_W / RBW_Hz
-    P_density_dBmHz = 10.0 * np.log10(P_density_W_Hz * 1000.0 + 1e-30)
+    # [Fix] Scale down by R_load (50 Ohm) to match VPI simulation results.
+    # VPI likely displays power into 50 Ohm as V^2/50 (or equivalent), whereas
+    # the previous Python code calculated I^2 * 50. The difference is a factor of 50 (17 dB).
+    # We divide by R_load to align with VPI's magnitude.
+    if vpi_compatible_dbm:
+        scale_factor = 1.0 / R_load
+    else:
+        scale_factor = 1.0
+
+    P_noise_total_W_scaled = P_noise_total_W * scale_factor
+    P_noise_floor_dBm = 10.0 * np.log10(P_noise_total_W_scaled * 1000.0 + 1e-30)
+
+    P_density_W_Hz_scaled = P_noise_total_W_scaled / RBW_Hz
+    P_density_dBmHz = 10.0 * np.log10(P_density_W_Hz_scaled * 1000.0 + 1e-30)
 
     noise_res = NoiseResult(
-        P_thermal_W=P_thermal_W,
-        P_shot_W=P_shot_W,
-        P_rin_W=P_rin_W,
-        P_noise_total_W=P_noise_total_W,
+        P_thermal_W=P_thermal_W * scale_factor,
+        P_shot_W=P_shot_W * scale_factor,
+        P_rin_W=P_rin_W * scale_factor,
+        P_noise_total_W=P_noise_total_W_scaled,
         P_noise_floor_dBm=P_noise_floor_dBm,
         P_density_dBmHz=P_density_dBmHz,
     )
@@ -155,12 +172,19 @@ def simulate_mzm(
         P1[1:-1] = 2.0 * P1[1:-1]
     f_elec = Fs * np.arange(0, half + 1) / L
 
-    P_sig_W = 0.5 * (P1 ** 2) * R_load
-    if P1.size > 0:
-        P_sig_W[0] = (P1[0] ** 2) * R_load
+    # [Fix] Remove * R_load factor to match VPI (17 dB lower).
+    # Effectively calculating Power = I^2 (or V^2/50 if V=I*50).
+    if vpi_compatible_dbm:
+        P_sig_W = 0.5 * (P1 ** 2)
+        if P1.size > 0:
+            P_sig_W[0] = (P1[0] ** 2)
+    else:
+        P_sig_W = 0.5 * (P1 ** 2) * R_load
+        if P1.size > 0:
+            P_sig_W[0] = (P1[0] ** 2) * R_load
 
     rng = np.random.default_rng()
-    noise_trace_W = P_noise_total_W * (-np.log(rng.random(P_sig_W.shape)))
+    noise_trace_W = P_noise_total_W_scaled * (-np.log(rng.random(P_sig_W.shape)))
 
     P_total_W = P_sig_W + noise_trace_W
     P_elec_spec_dBm = 10.0 * np.log10(P_total_W * 1000.0 + 1e-20)
@@ -369,30 +393,45 @@ def _measure_pd_dither_1f2f_batch_torch(
     # Add RF signal if specified (high-frequency modulation)
     # Note: For realistic simulation, RF frequency >> dither frequency
     # The RF signal adds perturbation to the optical power, affecting dither measurement
-    if float(V_rf_amp) > 0:
-        w_rf = 2.0 * float(np.pi) * float(f_rf)
-        rf_signal = float(V_rf_amp) * torch.sin(w_rf * t)  # [N]
-        V_t = Vb[:, None] + dither[None, :] + rf_signal[None, :]  # [B, N]
-    else:
-        V_t = Vb[:, None] + dither[None, :]  # [B, N]
+    #
+    # FIX (2025-12-30): Instead of adding random noise or aliased sampling,
+    # we use the analytical "J0 scaling" effect.
+    # The fast RF modulation V_rf * sin(w_rf * t) effectively scales the
+    # interference term of the MZM transfer function by Bessel function J0(beta).
+    # This is the physically correct model for a bandwidth-limited PD detecting
+    # a bias dither in the presence of high-speed RF modulation.
+    
+    # V_t only contains bias + dither (slow signals)
+    V_t = Vb[:, None] + dither[None, :]  # [B, N]
 
     # DC transfer (same as mzm_dc_power_mW) in torch
     Pin_W = 10.0 ** ((float(Pin_dBm) - 30.0) / 10.0)
-    E_in = float(np.sqrt(Pin_W))
-
+    
     loss_factor = 10.0 ** (-float(IL_dB) / 10.0)
     er_linear = 10.0 ** (float(ER_dB) / 20.0)
     gamma = (er_linear - 1.0) / (er_linear + 1.0)
 
-    phi1 = (float(np.pi) / float(Vpi_DC)) * (V_t / 2.0)
-    phi2 = (float(np.pi) / float(Vpi_DC)) * (-V_t / 2.0)
-    E_out = (
-        E_in
-        * float(np.sqrt(loss_factor))
-        * 0.5
-        * (torch.exp(1j * phi1) + float(gamma) * torch.exp(1j * phi2))
-    )
-    P_W = (torch.abs(E_out) ** 2)  # [B, N]
+    # Calculate RF scaling factor J0(beta)
+    # beta = pi * V_rf / Vpi
+    if float(V_rf_amp) > 0:
+        beta_rf = (float(np.pi) / float(Vpi_DC)) * float(V_rf_amp)
+        # Use torch.special.bessel_j0 if available, else fallback or assume recent torch
+        j0_scale = float(torch.special.bessel_j0(torch.tensor(beta_rf)))
+    else:
+        j0_scale = 1.0
+
+    # Calculate Power directly using the intensity formula
+    # P_out = P_in * loss * 0.25 * [ (1 + gamma^2) + 2*gamma*J0*cos(pi*V/Vpi) ]
+    # This avoids complex number operations and allows easy J0 scaling.
+    
+    P_scale = Pin_W * float(np.sqrt(loss_factor))**2 * 0.25
+    term_const = 1.0 + float(gamma)**2
+    
+    # Phase difference phi1 - phi2 = (pi/Vpi) * V_t
+    theta_t = (float(np.pi) / float(Vpi_DC)) * V_t
+    term_interf = 2.0 * float(gamma) * j0_scale * torch.cos(theta_t)
+    
+    P_W = P_scale * (term_const + term_interf)  # [B, N]
 
     # PD current
     I_pd = float(Responsivity) * P_W
