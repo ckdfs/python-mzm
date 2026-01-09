@@ -149,7 +149,29 @@ def evaluate_current_and_best(
         label="Current Model",
     )
 
+    # If feature versions differ, comparisons are meaningless; keep best untouched.
+    try:
+        _, current_meta = _load_model(model_path)
+        current_feature_version = str(current_meta.get("feature_version", "legacy"))
+    except FileNotFoundError:
+        current_feature_version = "legacy"
+
     best_stats: dict | None = None
+    best_feature_version: str | None = None
+    if best_model_path.exists():
+        try:
+            _, best_meta = _load_model(best_model_path)
+            best_feature_version = str(best_meta.get("feature_version", "legacy"))
+        except FileNotFoundError:
+            best_feature_version = None
+
+    if best_feature_version is not None and best_feature_version != current_feature_version:
+        update_action = (
+            f"Best model feature_version mismatch (best={best_feature_version}, current={current_feature_version}); "
+            "skipping best comparison/update."
+        )
+        return current_stats, None, update_action
+
     if best_eval_path.exists():
         data = np.load(best_eval_path)
         best_stats = {k: data[k] for k in data.files}

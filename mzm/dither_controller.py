@@ -7,8 +7,10 @@ What this implements
 
 To recover direction (which is lost if you only use power magnitudes), the controller
 uses a *history finite difference* (more realistic than taking an extra probe sample):
-    x_k = [P1/pd_dc, P2/pd_dc, dP1_norm, dP2_norm, dV_{k-1}, sin(theta*), cos(theta*)]
-where dP*_norm = (P*/pd_dc)(k) - (P*/pd_dc)(k-1).
+    raw_k = [H1_k, H2_k] where H* = (harmonic amplitude) / pd_dc
+    shape_k = raw_k / sqrt(H1_k^2 + H2_k^2 + eps)
+    x_k = [shape1_k, shape2_k, dshape1, dshape2, dV_{k-1}, sin(theta*), cos(theta*)]
+where dshape* = shape*(k) - shape*(k-1).
 
 DC Normalization: By dividing harmonic amplitudes by pd_dc (mean photocurrent),
 the features become robust against input optical power fluctuations (e.g., laser
@@ -42,6 +44,233 @@ from mzm.model import (
     theta_to_bias_V,
     wrap_to_pi,
 )
+
+_DEFAULT_FEATURE_MODE = "theta_est_hist"
+
+
+def _bessel_j1_small(x: float) -> float:
+    """Approximate J1(x) for small x using a 3-term series."""
+
+    x2 = float(x) * float(x)
+    return float(x) / 2.0 - (float(x) * x2) / 16.0 + (float(x) * x2 * x2) / 384.0
+
+
+def _bessel_j2_small(x: float) -> float:
+    """Approximate J2(x) for small x using a 3-term series."""
+
+    x2 = float(x) * float(x)
+    return x2 / 8.0 - (x2 * x2) / 96.0 + (x2 * x2 * x2) / 3072.0
+
+
+def _bessel_j0_small(x: float) -> float:
+    """Approximate J0(x) for small x using a 3-term series."""
+
+    x2 = float(x) * float(x)
+    return 1.0 - x2 / 4.0 + (x2 * x2) / 64.0
+
+
+def _gamma_from_er_db(er_db: float) -> float:
+    er_linear = 10.0 ** (float(er_db) / 20.0)
+    return float((er_linear - 1.0) / (er_linear + 1.0))
+
+
+def _estimate_theta_from_harmonics_np(
+    h1_norm: np.ndarray,
+    h2_norm: np.ndarray,
+    *,
+    theta_prior_rad: np.ndarray | None = None,
+    dither_params: "DitherParams",
+    device_params: "DeviceParams",
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate theta in [0, pi] from (h1_norm, h2_norm), eliminating RF scaling.
+
+    Uses the analytical small-signal model:
+      h1 = 2*b*J1(beta_d)*|sin(theta)| / (a + b*J0(beta_d)*cos(theta))
+      h2 = 2*b*J2(beta_d)*|cos(theta)| / (a + b*J0(beta_d)*cos(theta))
+    where a = 1 + gamma^2, b = 2*gamma*J0(beta_rf) is a nuisance parameter.
+
+    We resolve the sign ambiguity (theta vs pi-theta) using an external prior
+    (typically the commanded bias converted to phase via Vpi), which is available
+    in closed-loop operation. This avoids brittle inference near deep nulls.
+    """
+
+    h1 = np.asarray(h1_norm, dtype=np.float32)
+    h2 = np.asarray(h2_norm, dtype=np.float32)
+
+    beta_d = float(np.pi) * float(dither_params.V_dither_amp) / float(device_params.Vpi_DC)
+    j0 = _bessel_j0_small(beta_d)
+    j1 = _bessel_j1_small(beta_d)
+    j2 = _bessel_j2_small(beta_d)
+    j1 = float(j1) if abs(j1) > 1e-12 else 1e-12
+    j2 = float(j2) if abs(j2) > 1e-12 else 1e-12
+
+    gamma = _gamma_from_er_db(float(device_params.ER_dB))
+    a = 1.0 + gamma * gamma
+    b_max = 2.0 * gamma
+
+    p = h1 / np.float32(2.0 * j1)
+    q = h2 / np.float32(2.0 * j2)
+
+    theta_abs = np.arctan2(p, q).astype(np.float32)  # [0, pi/2]
+    sin_abs = np.sin(theta_abs).astype(np.float32)
+    cos_abs = np.cos(theta_abs).astype(np.float32)
+
+    w = (p / (sin_abs + np.float32(eps))).astype(np.float32)  # b / (a + b*j0*cos)
+
+    # Estimate b for both sign hypotheses (cos positive/negative).
+    denom_plus = (1.0 - w * np.float32(j0) * cos_abs).astype(np.float32)
+    denom_minus = (1.0 + w * np.float32(j0) * cos_abs).astype(np.float32)
+    b_plus = (w * np.float32(a)) / (denom_plus + np.float32(eps))
+    b_minus = (w * np.float32(a)) / (denom_minus + np.float32(eps))
+
+    if theta_prior_rad is None:
+        # Fallback: choose the hypothesis whose b stays in-range and closer to b_max (more physical for high ER).
+        ok_plus = (b_plus > 0.0) & (b_plus <= np.float32(b_max + 1e-6))
+        ok_minus = (b_minus > 0.0) & (b_minus <= np.float32(b_max + 1e-6))
+        # Prefer valid; if both valid, prefer larger b (shallower null is more stable numerically).
+        choose_plus = np.where(ok_plus & ~ok_minus, True, np.where(ok_minus & ~ok_plus, False, b_plus >= b_minus))
+    else:
+        prior = np.asarray(theta_prior_rad, dtype=np.float32)
+        cand_plus = theta_abs
+        cand_minus = (np.float32(np.pi) - theta_abs).astype(np.float32)
+        choose_plus = (np.abs(cand_plus - prior) <= np.abs(cand_minus - prior))
+
+    theta_est = np.where(choose_plus, theta_abs, (np.float32(np.pi) - theta_abs)).astype(np.float32)
+    b_est = np.where(choose_plus, b_plus, b_minus).astype(np.float32)
+    b_est = np.clip(b_est, 0.0, np.float32(b_max)).astype(np.float32)
+    return theta_est, b_est
+
+
+def _estimate_theta_from_harmonics_torch(
+    h1_norm: torch.Tensor,
+    h2_norm: torch.Tensor,
+    *,
+    theta_prior_rad: torch.Tensor | None = None,
+    dither_params: "DitherParams",
+    device_params: "DeviceParams",
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    h1 = h1_norm.to(dtype=torch.float32)
+    h2 = h2_norm.to(dtype=torch.float32)
+
+    beta_d = float(np.pi) * float(dither_params.V_dither_amp) / float(device_params.Vpi_DC)
+    j0 = float(_bessel_j0_small(beta_d))
+    j1 = float(_bessel_j1_small(beta_d))
+    j2 = float(_bessel_j2_small(beta_d))
+    j1 = j1 if abs(j1) > 1e-12 else 1e-12
+    j2 = j2 if abs(j2) > 1e-12 else 1e-12
+
+    gamma = float(_gamma_from_er_db(float(device_params.ER_dB)))
+    a = float(1.0 + gamma * gamma)
+    b_max = float(2.0 * gamma)
+
+    p = h1 / float(2.0 * j1)
+    q = h2 / float(2.0 * j2)
+
+    theta_abs = torch.atan2(p, q)  # [0, pi/2]
+    sin_abs = torch.sin(theta_abs)
+    cos_abs = torch.cos(theta_abs)
+
+    w = p / (sin_abs + float(eps))
+
+    denom_plus = 1.0 - w * float(j0) * cos_abs
+    denom_minus = 1.0 + w * float(j0) * cos_abs
+    b_plus = (w * float(a)) / (denom_plus + float(eps))
+    b_minus = (w * float(a)) / (denom_minus + float(eps))
+
+    if theta_prior_rad is None:
+        ok_plus = (b_plus > 0.0) & (b_plus <= float(b_max + 1e-6))
+        ok_minus = (b_minus > 0.0) & (b_minus <= float(b_max + 1e-6))
+        choose_plus = torch.where(ok_plus & ~ok_minus, True, torch.where(ok_minus & ~ok_plus, False, b_plus >= b_minus))
+    else:
+        prior = theta_prior_rad.to(dtype=torch.float32)
+        cand_plus = theta_abs
+        cand_minus = float(np.pi) - theta_abs
+        choose_plus = torch.abs(cand_plus - prior) <= torch.abs(cand_minus - prior)
+
+    theta_est = torch.where(choose_plus, theta_abs, (float(np.pi) - theta_abs))
+    b_est = torch.where(choose_plus, b_plus, b_minus)
+    b_est = torch.clamp(b_est, 0.0, float(b_max))
+    return theta_est, b_est
+
+
+def _bessel_equalized_shape_normalize_np(
+    h1: np.ndarray,
+    h2: np.ndarray,
+    *,
+    V_dither_amp: float,
+    Vpi_DC: float,
+    eps: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bessel-equalize 1f/2f before shape normalization.
+
+    For small dither depth beta_d = pi*V_dither/Vpi, the 2f component is scaled by
+    J2(beta_d), which is orders of magnitude smaller than J1(beta_d). If we
+    shape-normalize [h1, h2] directly, the vector collapses toward the 1f axis.
+
+    We first equalize:
+      z1 = h1 / J1(beta_d), z2 = h2 / J2(beta_d)
+    then shape-normalize z to remove common scaling (including RF J0(beta_rf)).
+    """
+
+    beta_d = float(np.pi) * float(V_dither_amp) / float(Vpi_DC)
+    j1 = _bessel_j1_small(beta_d)
+    j2 = _bessel_j2_small(beta_d)
+    j_eps = 1e-12
+    j1 = float(j1) if abs(j1) > j_eps else (j_eps if j1 >= 0 else -j_eps)
+    j2 = float(j2) if abs(j2) > j_eps else (j_eps if j2 >= 0 else -j_eps)
+
+    h1 = np.asarray(h1, dtype=np.float32)
+    h2 = np.asarray(h2, dtype=np.float32)
+    z1 = (h1 / np.float32(j1)).astype(np.float32)
+    z2 = (h2 / np.float32(j2)).astype(np.float32)
+
+    s = np.sqrt(z1 * z1 + z2 * z2 + float(eps)).astype(np.float32)
+    return (z1 / s).astype(np.float32), (z2 / s).astype(np.float32), s
+
+
+def _bessel_equalized_shape_normalize_torch(
+    h1: torch.Tensor,
+    h2: torch.Tensor,
+    *,
+    V_dither_amp: float,
+    Vpi_DC: float,
+    eps: float = 1e-12,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    beta_d = float(np.pi) * float(V_dither_amp) / float(Vpi_DC)
+    j1 = _bessel_j1_small(beta_d)
+    j2 = _bessel_j2_small(beta_d)
+    j_eps = 1e-12
+    j1 = float(j1) if abs(j1) > j_eps else (j_eps if j1 >= 0 else -j_eps)
+    j2 = float(j2) if abs(j2) > j_eps else (j_eps if j2 >= 0 else -j_eps)
+
+    h1 = h1.to(dtype=torch.float32)
+    h2 = h2.to(dtype=torch.float32)
+    z1 = h1 / float(j1)
+    z2 = h2 / float(j2)
+    s = torch.sqrt(z1 * z1 + z2 * z2 + float(eps))
+    return z1 / s, z2 / s, s
+
+
+def _shape_normalize_np(
+    h1: np.ndarray, h2: np.ndarray, *, eps: float = 1e-12
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Normalize [h1, h2] by its L2 norm to remove common scaling."""
+
+    h1 = np.asarray(h1, dtype=np.float32)
+    h2 = np.asarray(h2, dtype=np.float32)
+    s = np.sqrt(h1 * h1 + h2 * h2 + float(eps)).astype(np.float32)
+    return (h1 / s).astype(np.float32), (h2 / s).astype(np.float32), s
+
+
+def _shape_normalize_torch(
+    h1: torch.Tensor, h2: torch.Tensor, *, eps: float = 1e-12
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    h1 = h1.to(dtype=torch.float32)
+    h2 = h2.to(dtype=torch.float32)
+    s = torch.sqrt(h1 * h1 + h2 * h2 + float(eps))
+    return h1 / s, h2 / s, s
 
 
 @dataclass
@@ -93,6 +322,7 @@ def generate_dataset_dbm_hist(
     seed: int = 0,
     teacher_gain: float = 0.5,
     max_step_V: float = 0.2,
+    feature_mode: str = _DEFAULT_FEATURE_MODE,
     accel: str = "auto",
     torch_batch: int = 512,
     V_rf_amp: float = 0.0,
@@ -111,6 +341,10 @@ def generate_dataset_dbm_hist(
 
     Returns a dict containing Xn, y, and normalization stats.
     """
+
+    feature_mode_norm = str(feature_mode).lower().strip()
+    if feature_mode_norm not in {"dc_norm_hist", "shape_norm_bessel", "theta_est_hist"}:
+        raise ValueError("feature_mode must be one of: 'dc_norm_hist', 'shape_norm_bessel', 'theta_est_hist'")
 
     rng = np.random.default_rng(seed)
 
@@ -198,22 +432,82 @@ def generate_dataset_dbm_hist(
     h1, h2 = _measure_normalized_torch(V_bias)
     h1_prev, h2_prev = _measure_normalized_torch(V_prev)
 
-    dh1 = (h1 - h1_prev).astype(np.float32)
-    dh2 = (h2 - h2_prev).astype(np.float32)
     te = _target_encoding(theta_target.astype(np.float32))
 
-    X = np.stack(
-        [
-            h1.astype(np.float32),   # DC-normalized 1f amplitude
-            h2.astype(np.float32),   # DC-normalized 2f amplitude
-            dh1,                      # delta h1_norm
-            dh2,                      # delta h2_norm
-            dv_prev.astype(np.float32),
-            te[:, 0].astype(np.float32),
-            te[:, 1].astype(np.float32),
-        ],
-        axis=1,
-    ).astype(np.float32)
+    if feature_mode_norm == "dc_norm_hist":
+        dh1 = (h1 - h1_prev).astype(np.float32)
+        dh2 = (h2 - h2_prev).astype(np.float32)
+        X = np.stack(
+            [
+                h1.astype(np.float32),
+                h2.astype(np.float32),
+                dh1,
+                dh2,
+                dv_prev.astype(np.float32),
+                te[:, 0].astype(np.float32),
+                te[:, 1].astype(np.float32),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        feature_version = "dc_norm_hist_v1"
+    elif feature_mode_norm == "shape_norm_bessel":
+        u1, u2, _ = _bessel_equalized_shape_normalize_np(
+            h1, h2, V_dither_amp=float(dither_params.V_dither_amp), Vpi_DC=float(device_params.Vpi_DC)
+        )
+        u1_prev, u2_prev, _ = _bessel_equalized_shape_normalize_np(
+            h1_prev, h2_prev, V_dither_amp=float(dither_params.V_dither_amp), Vpi_DC=float(device_params.Vpi_DC)
+        )
+        du1 = (u1 - u1_prev).astype(np.float32)
+        du2 = (u2 - u2_prev).astype(np.float32)
+        X = np.stack(
+            [
+                u1.astype(np.float32),
+                u2.astype(np.float32),
+                du1,
+                du2,
+                dv_prev.astype(np.float32),
+                te[:, 0].astype(np.float32),
+                te[:, 1].astype(np.float32),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        feature_version = "shape_norm_bessel_v1"
+    else:
+        theta_prior = bias_to_theta_rad(V_bias.astype(float), Vpi_DC=device_params.Vpi_DC).astype(np.float32)
+        theta_prior_prev = bias_to_theta_rad(V_prev.astype(float), Vpi_DC=device_params.Vpi_DC).astype(np.float32)
+        theta_est, _ = _estimate_theta_from_harmonics_np(
+            h1,
+            h2,
+            theta_prior_rad=theta_prior,
+            dither_params=dither_params,
+            device_params=device_params,
+        )
+        theta_prev_est, _ = _estimate_theta_from_harmonics_np(
+            h1_prev,
+            h2_prev,
+            theta_prior_rad=theta_prior_prev,
+            dither_params=dither_params,
+            device_params=device_params,
+        )
+        s = np.sin(theta_est).astype(np.float32)
+        c = np.cos(theta_est).astype(np.float32)
+        s_prev = np.sin(theta_prev_est).astype(np.float32)
+        c_prev = np.cos(theta_prev_est).astype(np.float32)
+        ds = (s - s_prev).astype(np.float32)
+        dc = (c - c_prev).astype(np.float32)
+        X = np.stack(
+            [
+                s,
+                c,
+                ds,
+                dc,
+                dv_prev.astype(np.float32),
+                te[:, 0].astype(np.float32),
+                te[:, 1].astype(np.float32),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        feature_version = "theta_est_hist_v2"
 
     # Teacher label: proportional step in wrapped phase error
     th_c = bias_to_theta_rad(V_bias.astype(float), Vpi_DC=device_params.Vpi_DC).astype(np.float32)
@@ -231,6 +525,8 @@ def generate_dataset_dbm_hist(
         "y": y,
         "mu": mu,
         "sigma": sigma,
+        "feature_mode": feature_mode_norm,
+        "feature_version": feature_version,
         "device_params": device_params,
         "dither_params": dither_params,
         "teacher_gain": float(teacher_gain),
@@ -250,6 +546,8 @@ def save_dataset(dataset: dict, path: str | Path) -> None:
         y=dataset["y"],
         mu=dataset["mu"],
         sigma=dataset["sigma"],
+        feature_version=np.array(dataset.get("feature_version", "legacy"), dtype=object),
+        feature_mode=np.array(dataset.get("feature_mode", "legacy"), dtype=object),
         device_params=np.array(list(dataset["device_params"].__dict__.items()), dtype=object),
         dither_params=np.array(list(dataset["dither_params"].__dict__.items()), dtype=object),
         teacher_gain=np.array(dataset["teacher_gain"], dtype=np.float32),
@@ -268,12 +566,16 @@ def load_dataset(path: str | Path) -> dict:
     # Load RF parameters (with backward compatibility for old datasets)
     V_rf_amp = float(z["V_rf_amp"]) if "V_rf_amp" in z.files else 0.0
     f_rf = float(z["f_rf"]) if "f_rf" in z.files else 1e9
+    feature_version = str(z["feature_version"]) if "feature_version" in z.files else "legacy"
+    feature_mode = str(z["feature_mode"]) if "feature_mode" in z.files else "legacy"
 
     return {
         "Xn": z["Xn"].astype(np.float32),
         "y": z["y"].astype(np.float32),
         "mu": z["mu"].astype(np.float32),
         "sigma": z["sigma"].astype(np.float32),
+        "feature_version": feature_version,
+        "feature_mode": feature_mode,
         "device_params": device_params,
         "dither_params": dither_params,
         "teacher_gain": float(z["teacher_gain"]),
@@ -390,6 +692,7 @@ def save_model(
     sigma: np.ndarray,
     device_params: DeviceParams,
     dither_params: DitherParams,
+    feature_version: str = "legacy",
     path: str | Path,
 ) -> None:
     path = Path(path)
@@ -399,6 +702,7 @@ def save_model(
         "model_state": model.state_dict(),
         "mu": mu.astype(np.float32),
         "sigma": sigma.astype(np.float32),
+        "feature_version": str(feature_version),
         "arch": {
             "in_dim": getattr(model, "in_dim", int(mu.shape[0])),
             "hidden": getattr(model, "hidden", 64),
@@ -458,6 +762,7 @@ def load_model(path: str | Path) -> tuple[nn.Module, dict]:
     meta = {
         "mu": np.asarray(ckpt["mu"], dtype=np.float32),
         "sigma": np.asarray(ckpt["sigma"], dtype=np.float32),
+        "feature_version": str(ckpt.get("feature_version", "legacy")),
         "device_params": DeviceParams(**ckpt["device_params"]),
         "dither_params": DitherParams(**ckpt["dither_params"]),
     }
@@ -478,6 +783,8 @@ def rollout_dbm_hist(
     accel: str = "auto",
     V_rf_amp: float = 0.0,
     f_rf: float = 1e9,
+    max_step_V: float = 0.2,
+    feature_mode: str = _DEFAULT_FEATURE_MODE,
 ) -> dict:
     """Single-trajectory rollout with optional RF signal.
     
@@ -531,8 +838,14 @@ def rollout_dbm_hist(
 
     V = float(np.clip(V_init, 0.0, Vpi))
 
-    prev_h1 = None
-    prev_h2 = None
+    feature_mode_norm = str(feature_mode).lower().strip()
+    if feature_mode_norm not in {"dc_norm_hist", "shape_norm_bessel", "theta_est_hist"}:
+        raise ValueError("feature_mode must be one of: 'dc_norm_hist', 'shape_norm_bessel', 'theta_est_hist'")
+
+    prev_u1 = None
+    prev_u2 = None
+    prev_s = None
+    prev_c = None
     prev_dv = 0.0
 
     V_hist: list[float] = []
@@ -542,7 +855,11 @@ def rollout_dbm_hist(
     h2_hist: list[float] = []
     dh1_hist: list[float] = []
     dh2_hist: list[float] = []
+    h1_raw_hist: list[float] = []
+    h2_raw_hist: list[float] = []
     theta_deg_hist: list[float] = []
+    theta_est_deg_hist: list[float] = []
+    b_est_hist: list[float] = []
 
     for _ in range(int(steps)):
         vb_t = torch.tensor([float(V)], device=device, dtype=torch.float32)
@@ -565,17 +882,58 @@ def rollout_dbm_hist(
 
         h1 = float(h1_t[0].item())
         h2 = float(h2_t[0].item())
-        dh1 = 0.0 if prev_h1 is None else (h1 - float(prev_h1))
-        dh2 = 0.0 if prev_h2 is None else (h2 - float(prev_h2))
+
+        if feature_mode_norm == "dc_norm_hist":
+            dh1 = 0.0 if prev_u1 is None else (h1 - float(prev_u1))
+            dh2 = 0.0 if prev_u2 is None else (h2 - float(prev_u2))
+            x0, x1, x2, x3 = h1, h2, dh1, dh2
+            theta_est_deg = float("nan")
+            b_est = float("nan")
+        elif feature_mode_norm == "shape_norm_bessel":
+            u1, u2, _ = _bessel_equalized_shape_normalize_np(
+                np.array([h1], dtype=np.float32),
+                np.array([h2], dtype=np.float32),
+                V_dither_amp=float(dither_params.V_dither_amp),
+                Vpi_DC=float(device_params.Vpi_DC),
+            )
+            u1 = float(u1[0])
+            u2 = float(u2[0])
+            du1 = 0.0 if prev_u1 is None else (u1 - float(prev_u1))
+            du2 = 0.0 if prev_u2 is None else (u2 - float(prev_u2))
+            x0, x1, x2, x3 = u1, u2, du1, du2
+            theta_est_deg = float("nan")
+            b_est = float("nan")
+        else:
+            theta_est, b_est_arr = _estimate_theta_from_harmonics_np(
+                np.array([h1], dtype=np.float32),
+                np.array([h2], dtype=np.float32),
+                theta_prior_rad=np.array([bias_to_theta_rad(V, Vpi_DC=device_params.Vpi_DC)], dtype=np.float32),
+                dither_params=dither_params,
+                device_params=device_params,
+            )
+            theta_est = float(theta_est[0])
+            b_est = float(b_est_arr[0])
+            s = float(np.sin(theta_est))
+            c = float(np.cos(theta_est))
+            ds = 0.0 if prev_s is None else (s - float(prev_s))
+            dc = 0.0 if prev_c is None else (c - float(prev_c))
+            x0, x1, x2, x3 = s, c, ds, dc
+            theta_est_deg = float(np.rad2deg(theta_est))
 
         te = _target_encoding(np.array([th_t], dtype=np.float32))[0]
-        x = np.array([h1, h2, dh1, dh2, float(prev_dv), float(te[0]), float(te[1])], dtype=np.float32)
+        x = np.array([x0, x1, x2, x3, float(prev_dv), float(te[0]), float(te[1])], dtype=np.float32)
         xn = (x - mu) / sigma
 
         dv = float(model(torch.from_numpy(xn).to(device).unsqueeze(0)).cpu().numpy().reshape(-1)[0])
+        dv = float(np.clip(dv, -float(max_step_V), float(max_step_V)))
         V = float(np.clip(V + dv, 0.0, Vpi))
 
-        prev_h1, prev_h2 = h1, h2
+        if feature_mode_norm == "dc_norm_hist":
+            prev_u1, prev_u2 = h1, h2
+        elif feature_mode_norm == "shape_norm_bessel":
+            prev_u1, prev_u2 = x0, x1
+        else:
+            prev_s, prev_c = x0, x1
         prev_dv = dv
 
         th_c = float(bias_to_theta_rad(V, Vpi_DC=device_params.Vpi_DC))
@@ -584,11 +942,16 @@ def rollout_dbm_hist(
         V_hist.append(V)
         err_deg_hist.append(float(np.rad2deg(err)))
         dv_hist.append(dv)
-        h1_hist.append(h1)
-        h2_hist.append(h2)
-        dh1_hist.append(dh1)
-        dh2_hist.append(dh2)
+        # Keep legacy key names for notebook/debug. Meanings depend on feature_mode.
+        h1_hist.append(float(x0))
+        h2_hist.append(float(x1))
+        dh1_hist.append(float(x2))
+        dh2_hist.append(float(x3))
+        h1_raw_hist.append(h1)
+        h2_raw_hist.append(h2)
         theta_deg_hist.append(float(np.rad2deg(th_c)))
+        theta_est_deg_hist.append(float(theta_est_deg))
+        b_est_hist.append(float(b_est))
 
     return {
         "V": np.asarray(V_hist, dtype=float),
@@ -598,7 +961,11 @@ def rollout_dbm_hist(
         "h2_norm": np.asarray(h2_hist, dtype=float),
         "dh1_norm": np.asarray(dh1_hist, dtype=float),
         "dh2_norm": np.asarray(dh2_hist, dtype=float),
+        "h1_norm_raw": np.asarray(h1_raw_hist, dtype=float),
+        "h2_norm_raw": np.asarray(h2_raw_hist, dtype=float),
         "theta_deg": np.asarray(theta_deg_hist, dtype=float),
+        "theta_est_deg": np.asarray(theta_est_deg_hist, dtype=float),
+        "b_est": np.asarray(b_est_hist, dtype=float),
     }
 
 
@@ -617,6 +984,8 @@ def rollout_dbm_hist_batch(
     V_rf_amp: float = 0.0,
     f_rf: float = 1e9,
     Pin_dBm: float | None = None,
+    max_step_V: float = 0.2,
+    feature_mode: str = _DEFAULT_FEATURE_MODE,
 ) -> dict:
     """Batch rollout with optional RF signal and optical power override for robustness testing.
     
@@ -679,9 +1048,15 @@ def rollout_dbm_hist_batch(
         2: (torch.sin(2.0 * w * t_ref), torch.cos(2.0 * w * t_ref)),
     }
 
+    feature_mode_norm = str(feature_mode).lower().strip()
+    if feature_mode_norm not in {"dc_norm_hist", "shape_norm_bessel", "theta_est_hist"}:
+        raise ValueError("feature_mode must be one of: 'dc_norm_hist', 'shape_norm_bessel', 'theta_est_hist'")
+
     # State initialization
-    prev_h1 = None
-    prev_h2 = None
+    prev_u1 = None
+    prev_u2 = None
+    prev_s = None
+    prev_c = None
     prev_dv = torch.zeros_like(V)
 
     # History storage (on CPU to save GPU memory if steps are large, or keep on GPU?)
@@ -715,28 +1090,72 @@ def rollout_dbm_hist_batch(
             f_rf=float(f_rf),
         )
 
-        # Deltas
-        if prev_h1 is None:
-            dh1 = torch.zeros_like(h1)
-            dh2 = torch.zeros_like(h2)
+        if feature_mode_norm == "dc_norm_hist":
+            x0 = h1
+            x1 = h2
+            if prev_u1 is None:
+                x2 = torch.zeros_like(h1)
+                x3 = torch.zeros_like(h2)
+            else:
+                x2 = h1 - prev_u1
+                x3 = h2 - prev_u2
+            prev_next_0 = h1
+            prev_next_1 = h2
+        elif feature_mode_norm == "shape_norm_bessel":
+            u1, u2, _ = _bessel_equalized_shape_normalize_torch(
+                h1,
+                h2,
+                V_dither_amp=float(dither_params.V_dither_amp),
+                Vpi_DC=float(device_params.Vpi_DC),
+            )
+            if prev_u1 is None:
+                du1 = torch.zeros_like(u1)
+                du2 = torch.zeros_like(u2)
+            else:
+                du1 = u1 - prev_u1
+                du2 = u2 - prev_u2
+            x0, x1, x2, x3 = u1, u2, du1, du2
+            prev_next_0 = u1
+            prev_next_1 = u2
         else:
-            dh1 = h1 - prev_h1
-            dh2 = h2 - prev_h2
+            theta_est, _ = _estimate_theta_from_harmonics_torch(
+                h1,
+                h2,
+                theta_prior_rad=(V / Vpi) * float(np.pi),
+                dither_params=dither_params,
+                device_params=device_params,
+            )
+            s = torch.sin(theta_est)
+            c = torch.cos(theta_est)
+            if prev_s is None:
+                ds = torch.zeros_like(s)
+                dc = torch.zeros_like(c)
+            else:
+                ds = s - prev_s
+                dc = c - prev_c
+            x0, x1, x2, x3 = s, c, ds, dc
+            prev_next_0 = s
+            prev_next_1 = c
 
         # Construct input
-        # x: [h1, h2, dh1, dh2, prev_dv, sin(th), cos(th)]
-        x = torch.stack([h1, h2, dh1, dh2, prev_dv, te_sin, te_cos], dim=1)
+        # x: [x0, x1, x2, x3, prev_dv, sin(th), cos(th)]
+        x = torch.stack([x0, x1, x2, x3, prev_dv, te_sin, te_cos], dim=1)
         xn = (x - mu_t) / sigma_t
 
         # Inference
         dv = model(xn).squeeze(1)  # (N, 1) -> (N,)
+        dv = torch.clamp(dv, -float(max_step_V), float(max_step_V))
 
         # Update
         V = torch.clamp(V + dv, 0.0, Vpi)
 
         # Update state
-        prev_h1 = h1
-        prev_h2 = h2
+        if feature_mode_norm in {"dc_norm_hist", "shape_norm_bessel"}:
+            prev_u1 = prev_next_0
+            prev_u2 = prev_next_1
+        else:
+            prev_s = prev_next_0
+            prev_c = prev_next_1
         prev_dv = dv
 
         # Calculate error for history

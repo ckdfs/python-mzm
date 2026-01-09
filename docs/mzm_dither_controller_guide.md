@@ -522,7 +522,7 @@ $$
 
 本节重点解释：
 
-- `dp1/dp2`、`dV_{k-1}` 与目标角度 $\theta^*$ 这类“涉及上一拍/目标”的量在数据集生成阶段如何构造；
+- `dU_1/dU_2`、`dV_{k-1}` 与目标角度 $\theta^*$ 这类“涉及上一拍/目标”的量在数据集生成阶段如何构造；
 - 为什么这种构造方式在物理上是自洽的（即：它对应一段在闭环系统中可能发生的历史）。
 
 对每个样本：
@@ -531,9 +531,9 @@ $$
 2. 随机采样目标角度 $\theta^*\sim\mathcal{U}(0,\pi)$（0–180°）。
 3. 随机采样上一拍动作 $\Delta V_{k-1}\sim\mathcal{U}(-\Delta V_{\max},\Delta V_{\max})$。
 4. 根据 $V_{k-1}=\mathrm{clip}(V_k-\Delta V_{k-1},0,V_\pi)$ 反推上一拍偏置。
-5. 分别在 $V_{k-1}$ 与 $V_k$ 下测量 `p1_dBm/p2_dBm`。
-  - 实现上为提高速度，`generate_dataset_dbm_hist()` 使用 torch 批量接口（`measure_pd_dither_1f2f_dbm_batch_torch()`）一次性计算整批样本的导频特征。
-6. 构造差分特征 $dp1,dp2$。
+5. 分别在 $V_{k-1}$ 与 $V_k$ 下测量 DC 归一化导频谐波幅度 $(\tilde{H}_{1},\tilde{H}_{2})$。
+  - 实现上为提高速度，`generate_dataset_dbm_hist()` 使用 torch 批量接口（`measure_pd_dither_normalized_batch_torch()`）一次性计算整批样本的导频特征。
+6. 对每个时刻从 $(\tilde{H}_1,\tilde{H}_2)$ 反演估计 $\hat\theta$（同时消去 RF 缩放 nuisance 参数），并使用 $(\sin\hat\theta,\cos\hat\theta)$ 及其差分作为特征。
 7. 将目标角度编码为 $(\sin\theta^*,\cos\theta^*)$，拼接得到 7 维输入特征。
 
 该流程确保差分来源于“可实现的历史”，而不是额外施加的探测动作。
@@ -696,8 +696,8 @@ $$
 
 - 给定目标角度（度）`theta_target_deg` 与初始偏置 `V_init`；
 - 迭代 steps 次：
-  1) 在当前偏置下测量 `p1_dBm/p2_dBm`；
-  2) 与历史构造 `dp1/dp2`，并带入上一拍 `prev_dv`；
+  1) 在当前偏置下测量 DC 归一化导频谐波幅度 `(h1_norm_raw, h2_norm_raw)`；
+  2) 从 `(h1_norm_raw, h2_norm_raw)` 反演估计 `theta_est`，并构造 `(sin(theta_est), cos(theta_est))` 及其差分，同时带入上一拍 `prev_dv`；
   3) 归一化后输入策略网络得到 `dv`；
   4) 更新偏置并限幅；
   5) 计算 wrapped 角度误差并记录。
@@ -716,44 +716,62 @@ $$
 回放过程可以用以下变量描述：
 
 - 状态：$V_k$（偏置电压，限制在 $[0,V_\pi]$）
- - 观测：$(\tilde{H}_{1,k},\tilde{H}_{2,k})$（由导频测量并 DC 归一化得到）
- - 历史：上一拍观测 $(\tilde{H}_{1,k-1},\tilde{H}_{2,k-1})$ 与上一拍动作 $\Delta V_{k-1}$
- - 动作：$\Delta V_k$（策略网络输出）
+- 观测（raw）：$(\tilde{H}_{1,k},\tilde{H}_{2,k})$（由导频测量并 DC 归一化得到）
+- 观测（estimated angle）：从 $(\tilde{H}_{1,k},\tilde{H}_{2,k})$ 联立方程反演得到 $\hat\theta_k\in[0,\pi]$，并使用 $(\sin\hat\theta_k,\cos\hat\theta_k)$ 作为稳定、带符号的观测。
+- 历史：上一拍观测 $(U_{1,k-1},U_{2,k-1})$ 与上一拍动作 $\Delta V_{k-1}$
+- 动作：$\Delta V_k$（策略网络输出）
 
 每一拍的更新（与实现一致）可写为：
 
-1) 测量：$\tilde{H}_{1,k},\tilde{H}_{2,k} \leftarrow \text{measure\_normalized}(V_k)$
+1) 测量（raw）：$\tilde{H}_{1,k},\tilde{H}_{2,k} \leftarrow \text{measure\_normalized}(V_k)$
+
+2) 角度反演（用于 RF 功率变化鲁棒性）：
+
+将 DC 归一化导频特征视为
+
+$$
+\tilde{H}_{1,k}=\frac{2bJ_1(\beta_d)|\sin\theta_k|}{a+bJ_0(\beta_d)\cos\theta_k},\quad
+\tilde{H}_{2,k}=\frac{2bJ_2(\beta_d)|\cos\theta_k|}{a+bJ_0(\beta_d)\cos\theta_k}
+$$
+
+其中 $a=1+\gamma^2$，$b=2\gamma J_0(\beta_{rf})$ 为 RF 引入的 nuisance 参数。由于仅幅度观测存在 $\theta$ 与 $\pi-\theta$ 的歧义，实现中使用当前偏置电压的先验 $\theta_{\text{prior}}=\pi V/V_\pi$ 来选择更接近先验的解，从而稳定地确定 $\hat\theta_k\in[0,\pi]$ 并提升 RF=0（深消光）场景下的鲁棒性。
+
+补充（详细推导与实现说明）：
+
+- 推导：`docs/theta_inversion_theory.md`
+- 代码：`mzm/dither_controller.py` 中 `_estimate_theta_from_harmonics_np()` / `_estimate_theta_from_harmonics_torch()`
  
- 2) 构造差分：
+ 3) 构造差分：
  
  $$
- \Delta \tilde{H}_{1,k}=\tilde{H}_{1,k}-\tilde{H}_{1,k-1},\quad
- \Delta \tilde{H}_{2,k}=\tilde{H}_{2,k}-\tilde{H}_{2,k-1}
+ \Delta U_{1,k}=U_{1,k}-U_{1,k-1},\quad
+ \Delta U_{2,k}=U_{2,k}-U_{2,k-1}
  $$
  
- 3) 组装并标准化输入：
+ 4) 组装并标准化输入：
  
  $$
- \hat{\mathbf{x}}_k = \frac{[\tilde{H}_{1,k},\tilde{H}_{2,k},\Delta \tilde{H}_{1,k},\Delta \tilde{H}_{2,k},\Delta V_{k-1},\sin\theta^*,\cos\theta^*]-\mu}{\sigma}
+ \hat{\mathbf{x}}_k = \frac{[\sin\hat\theta_k,\cos\hat\theta_k,\Delta\sin\hat\theta_k,\Delta\cos\hat\theta_k,\Delta V_{k-1},\sin\theta^*,\cos\theta^*]-\mu}{\sigma}
  $$
  
- 4) 策略输出与限幅：
+ 5) 策略输出与限幅：
  
  $$
  \Delta V_k = \pi_\psi(\hat{\mathbf{x}}_k),\quad
  V_{k+1}=\mathrm{clip}(V_k+\Delta V_k,0,V_\pi)
  $$
  
- 5) 误差记录：$e_k=\mathrm{wrap}(\theta^*-\theta(V_k))$。
+ 6) 误差记录：$e_k=\mathrm{wrap}(\theta^*-\theta(V_k))$。
 
 ### 9.2 回放返回的 trace 字段（用于逐轮展示）
 
 为支持逐轮过程打印与调试，当前实现除 `V/err_deg` 外，还返回：
 
 - `dv`：每轮策略输出的 $\Delta V_k$
- - `h1_norm, h2_norm`：每轮观测到的归一化 1f/2f 幅度
- - `dh1_norm, dh2_norm`：每轮观测差分
- - `theta_deg`：每轮偏置对应的角度（度）
+- `h1_norm_raw, h2_norm_raw`：每轮观测到的 DC 归一化 1f/2f 幅度（raw）
+- `h1_norm, h2_norm`：每轮观测到的估计角度编码 $(\sin\hat\theta,\cos\hat\theta)$
+- `dh1_norm, dh2_norm`：每轮观测差分 $(\Delta\sin\hat\theta,\Delta\cos\hat\theta)$
+- `theta_deg`：每轮偏置对应的角度（度）
 
 Notebook 入口 `mzm_dither_controller.ipynb` 默认以“单目标角度”方式运行，并打印上述 trace 以便审阅每轮推理过程。
 
