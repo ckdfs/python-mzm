@@ -357,6 +357,8 @@ def _measure_pd_dither_1f2f_batch_torch(
     # RF signal parameters (optional, for robustness testing)
     V_rf_amp: float = 0.0,
     f_rf: float = 1e9,
+    # Drift parameters
+    V_drift: float | torch.Tensor = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Torch batch core for PD dither 1f/2f measurement.
 
@@ -401,8 +403,10 @@ def _measure_pd_dither_1f2f_batch_torch(
     # This is the physically correct model for a bandwidth-limited PD detecting
     # a bias dither in the presence of high-speed RF modulation.
     
-    # V_t only contains bias + dither (slow signals)
-    V_t = Vb[:, None] + dither[None, :]  # [B, N]
+    # V_t only contains bias + dither (slow signals) + drift
+    # V_drift can be a scalar or a tensor broadcastable to Vb
+    V_total_bias = Vb + V_drift
+    V_t = V_total_bias[:, None] + dither[None, :]  # [B, N]
 
     # DC transfer (same as mzm_dc_power_mW) in torch
     Pin_W = 10.0 ** ((float(Pin_dBm) - 30.0) / 10.0)
@@ -616,6 +620,7 @@ def measure_pd_dither_1f2f_dbm_batch_torch(
     refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
     V_rf_amp: float = 0.0,
     f_rf: float = 1e9,
+    V_drift: float | torch.Tensor = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Torch/GPU-accelerated batch version of dither measurement.
 
@@ -648,6 +653,7 @@ def measure_pd_dither_1f2f_dbm_batch_torch(
         refs=refs,
         V_rf_amp=float(V_rf_amp),
         f_rf=float(f_rf),
+        V_drift=V_drift,
     )
     return out["p1_dBm"].to(dtype=torch.float32), out["p2_dBm"].to(dtype=torch.float32)
 
@@ -669,6 +675,7 @@ def measure_pd_dither_normalized_batch_torch(
     refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
     V_rf_amp: float = 0.0,
     f_rf: float = 1e9,
+    V_drift: float | torch.Tensor = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Torch/GPU-accelerated batch version with DC-normalized outputs.
 
@@ -704,6 +711,7 @@ def measure_pd_dither_normalized_batch_torch(
         refs=refs,
         V_rf_amp=float(V_rf_amp),
         f_rf=float(f_rf),
+        V_drift=V_drift,
     )
 
     pd_dc = out["pd_dc"]
