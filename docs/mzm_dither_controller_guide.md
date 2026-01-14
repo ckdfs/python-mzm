@@ -859,7 +859,30 @@ $$
 - **偏压漂移（加性电压扰动）**：`simulate_control_loop_with_drift(...)` 通过 `V_drift` 将传输曲线整体平移。
 - **Vpi 漂移（相位映射系数漂移）**：`simulate_control_loop_with_vpi_drift(...)` 将 `Vpi_true(t)` 用于物理测量，同时允许 `Vpi_used`（控制器/估计器假设）保持为标称值，以评估对标定失配的鲁棒性。
 
-Notebook `mzm_dither_controller.ipynb` 已提供对应示例代码块，可直接调整 `drift_step_rate` / `vpi_rel_step_rate` 扫描控制器极限。
+#### 10+.3.1 偏压漂移仿真实现更新（重要）
+
+偏压漂移下，若仍使用“仅幅度（无符号）的 1f/2f 特征”进行角度反演，易在大漂移时出现分支锁死与自洽错误，从而导致偶发的“看似不动但误差发散”的坏结果。
+
+为提升一致性与可观测性，当前 `simulate_control_loop_with_drift(...)` 已改为使用 **带符号 lock-in 分量**（`h1_I` 与 `h2_Q`，并做 DC 归一化）来直接估计 $\theta$，避免依赖先验进行分支选择，从而显著减少偏压漂移测试出现“坏图”的概率。
+
+#### 10+.3.2 Vpi 漂移自适应（在线估计）
+
+为应对 $V_\pi$ 漂移导致的环路增益失配，新增自适应版本：
+
+- `simulate_adaptive_control_loop(...)`：在线估计 `vpi_est`，并用 `vpi_est / vpi_nom` 对策略输出的 $\Delta V$ 做增益校正。
+
+其中 `vpi_est` 的更新采用：
+- **网格搜索**：在候选 `Vpi` 网格上反演角度并选择最优候选；
+- **置信度门限**：仅当信息量足够（例如 2f 强度足够、且 best/second-best 代价间隔足够大）时才更新；
+- **稳健更新**：对候选值做滑窗中位数 + 限幅相对步长 + EMA 平滑，抑制估计跳变与周期性爆炸。
+
+#### 10+.3.3 Notebook 调用方式更新
+
+Notebook 中漂移测试代码已整理为：
+- 倒数第二个 cell：仅保留偏压漂移仿真。
+- 最后一个 cell：调用模块函数 `run_vpi_drift_comparison(...)` 一键运行 baseline/adaptive 对比并绘图。
+
+Notebook `mzm_dither_controller.ipynb` 可直接调整 `drift_step_rate`、`vpi_drift_total_V`、`est_alpha` 等参数扫描控制器极限。
 
 ## 11. 针对 0 度死区的优化策略
 
@@ -926,7 +949,7 @@ requirements.txt 包含最小依赖：
 
 ## 14. 局限性
 
-1. **角度与电压的映射依赖 Vpi**：若硬件 Vpi 漂移或与仿真不一致，控制效果会退化，需要做参数辨识或在线自适应。
+1. **角度与电压的映射依赖 Vpi**：若硬件 Vpi 漂移或与仿真不一致，控制效果会退化。仓库已提供在线 Vpi 自适应（见 10+.3.2），但在 $\theta \approx 90^\circ$ 附近 2f 过小会导致 Vpi 弱可观测，需要依赖置信度门限与稳健更新来抑制跳变。
 2. **限幅会引入非线性**：靠近边界时，策略输出会被 clip 截断，误差收敛特性会改变，应在评估中明确区分“内点行为”和“边界行为”。
 
 ---
