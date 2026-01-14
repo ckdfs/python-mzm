@@ -1,3 +1,9 @@
+"""Drift simulation module for MZM control loop.
+
+This module provides tools to simulate the closed-loop controller's behavior
+under various drift conditions (bias drift, Vpi drift) to verify robustness.
+Typically used after training a model.
+"""
 
 import torch
 import numpy as np
@@ -5,6 +11,7 @@ import matplotlib.pyplot as plt
 from dataclasses import replace
 from .model import measure_pd_dither_normalized_batch_torch, bias_to_theta_rad, wrap_to_pi
 from .dither_controller import DeviceParams, DitherParams, _estimate_theta_from_harmonics_np
+from .utils import make_lockin_refs
 
 def get_bias_drift(t, step_rate=0.002):
     """
@@ -93,15 +100,7 @@ def simulate_control_loop_with_drift(
         sigma_t = sigma
 
     # Precompute lock-in references once (significantly reduces per-step overhead).
-    n_samples_time = int(
-        round((float(dither_params.n_periods) / float(dither_params.f_dither)) * float(dither_params.Fs))
-    )
-    t_ref = torch.arange(n_samples_time, dtype=torch.float32) / float(dither_params.Fs)
-    w = 2.0 * float(np.pi) * float(dither_params.f_dither)
-    refs = {
-        1: (torch.sin(w * t_ref), torch.cos(w * t_ref)),
-        2: (torch.sin(2.0 * w * t_ref), torch.cos(2.0 * w * t_ref)),
-    }
+    refs = make_lockin_refs(dither_params, torch.device("cpu"))
     
     for t in range(n_steps):
         # 1. Calculate Shift
@@ -269,15 +268,7 @@ def simulate_control_loop_with_vpi_drift(
         sigma_t = sigma
 
     # Precompute lock-in references once.
-    n_samples_time = int(
-        round((float(dither_params.n_periods) / float(dither_params.f_dither)) * float(dither_params.Fs))
-    )
-    t_ref = torch.arange(n_samples_time, dtype=torch.float32) / float(dither_params.Fs)
-    w = 2.0 * float(np.pi) * float(dither_params.f_dither)
-    refs = {
-        1: (torch.sin(w * t_ref), torch.cos(w * t_ref)),
-        2: (torch.sin(2.0 * w * t_ref), torch.cos(2.0 * w * t_ref)),
-    }
+    refs = make_lockin_refs(dither_params, torch.device("cpu"))
 
     for t in range(int(n_steps)):
         Vpi_true = get_vpi_true(

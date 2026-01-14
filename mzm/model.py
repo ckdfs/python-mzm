@@ -238,77 +238,6 @@ def simulate_mzm(
     )
 
 
-def mzm_dc_power_mW(
-    V_bias: np.ndarray | float,
-    *,
-    Vpi_DC: float = 5.0,
-    ER_dB: float = 30.0,
-    IL_dB: float = 6.0,
-    Pin_dBm: float = 10.0,
-) -> np.ndarray:
-    """Compute MZM DC (no-RF) optical power vs bias voltage.
-
-    This matches the bias-scan model used inside simulate_mzm().
-    Returns optical power in mW.
-    """
-
-    V_bias_arr = np.asarray(V_bias, dtype=float)
-
-    Pin_W = 10 ** ((Pin_dBm - 30.0) / 10.0)
-    E_in = np.sqrt(Pin_W)
-
-    loss_factor = 10 ** (-IL_dB / 10.0)
-    er_linear = 10 ** (ER_dB / 20.0)
-    gamma = (er_linear - 1.0) / (er_linear + 1.0)
-
-    phi1 = (np.pi / Vpi_DC) * (V_bias_arr / 2.0)
-    phi2 = (np.pi / Vpi_DC) * (-V_bias_arr / 2.0)
-
-    E_out = E_in * np.sqrt(loss_factor) * 0.5 * (np.exp(1j * phi1) + gamma * np.exp(1j * phi2))
-    P_mW = (np.abs(E_out) ** 2) * 1000.0
-    return P_mW
-
-
-def mzm_dc_power_curve_mW(
-    *,
-    Vpi_DC: float = 5.0,
-    ER_dB: float = 30.0,
-    IL_dB: float = 6.0,
-    Pin_dBm: float = 10.0,
-    V_min: float | None = None,
-    V_max: float | None = None,
-    n_points: int = 1000,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (V_scan, P_scan_mW) for DC bias sweep."""
-
-    if V_min is None:
-        V_min = 0.0
-    if V_max is None:
-        V_max = Vpi_DC
-
-    V_scan = np.linspace(float(V_min), float(V_max), int(n_points))
-    P_scan_mW = mzm_dc_power_mW(
-        V_scan,
-        Vpi_DC=Vpi_DC,
-        ER_dB=ER_dB,
-        IL_dB=IL_dB,
-        Pin_dBm=Pin_dBm,
-    )
-    return V_scan, P_scan_mW
-
-
-def simulation_summary(sim: SimulationResult) -> Dict[str, Any]:
-    """Return a compact dict summary for quick inspection/printing."""
-
-    return {
-        "Pin_dBm": sim.Pin_dBm,
-        "P_pd_avg_dBm": sim.P_pd_avg_dBm,
-        "RBW_Hz": sim.RBW_Hz,
-        "P_noise_floor_dBm": sim.noise.P_noise_floor_dBm,
-        "P_density_dBmHz": sim.noise.P_density_dBmHz,
-        "val_1G_dBm": sim.spectrum.val_1G_dBm,
-        "val_2G_dBm": sim.spectrum.val_2G_dBm,
-    }
 
 
 def bias_to_theta_rad(V_bias: np.ndarray | float, *, Vpi_DC: float = 5.0) -> np.ndarray:
@@ -408,7 +337,7 @@ def _measure_pd_dither_1f2f_batch_torch(
     V_total_bias = Vb + V_drift
     V_t = V_total_bias[:, None] + dither[None, :]  # [B, N]
 
-    # DC transfer (same as mzm_dc_power_mW) in torch
+    # DC transfer in torch
     Pin_W = 10.0 ** ((float(Pin_dBm) - 30.0) / 10.0)
     
     loss_factor = 10.0 ** (-float(IL_dB) / 10.0)

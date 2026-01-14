@@ -20,6 +20,3 @@
 
 更完整的理论推导与代码对应说明：
 - `docs/mzm_dither_controller_guide.md`
-
-也可以直接跑精简脚本（默认就是接近真实的控制方式，无需额外参数）：
-- `python scripts/train_mzm_dither_controller.py`

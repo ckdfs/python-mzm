@@ -117,7 +117,7 @@ $$
 *   **物理意义**：RF 信号的存在会降低 MZM 传输曲线的对比度（消光比看似下降），导致导频信号（$H_1, H_2$）的幅度整体衰减。
 *   **仿真实现**：在 `mzm/model.py` 中，我们直接计算该 $J_0$ 因子并应用到功率公式中，从而精确模拟 RF 干扰对控制回路的影响，避免了时域采样混叠带来的误差。
 
-代码中 `mzm_dc_power_mW()` 实现的就是上述 DC 传输曲线，返回单位为 mW。
+代码中 `simulate_mzm()` 内部实现了上述 DC 传输曲线。
 
 ### 2.3 工作点定义
 
@@ -887,15 +887,9 @@ Notebook `mzm_dither_controller.ipynb` 已提供对应示例代码块，可直�
 
 其结构已按“数据集生成 → 训练 → 推理/回放”拆分，并把工件写入 artifacts/ 以便复用。
 
-### 12.2 脚本入口：一键生成/训练/回放
+### 12.2 非 Notebook 一键入口（Python 调用）
 
-在仓库根目录运行：
-
-```bash
-python scripts/train_mzm_dither_controller.py
-```
-
-脚本会：
+若不使用 Notebook，可以在 Python 中直接调用 `mzm.dither_controller.run_pipeline()`（或 `main()`）来完成一键生成/训练/回放：
 
 1) 若数据集不存在则生成；
 2) 训练模型并保存；

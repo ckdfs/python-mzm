@@ -25,7 +25,7 @@ Artifacts
 
 NOTE
 - This file is intended to be imported (Notebook calls it). It does not act as a CLI script.
-- For a CLI entry, use scripts/train_mzm_dither_controller.py.
+- To run the default pipeline without notebooks, call run_pipeline() (or main()) from Python.
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ from mzm.model import (
     theta_to_bias_V,
     wrap_to_pi,
 )
+from mzm.utils import select_device, make_lockin_refs
 
 _DEFAULT_FEATURE_MODE = "theta_est_hist"
 
@@ -253,26 +254,6 @@ def _bessel_equalized_shape_normalize_torch(
     return z1 / s, z2 / s, s
 
 
-def _shape_normalize_np(
-    h1: np.ndarray, h2: np.ndarray, *, eps: float = 1e-12
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Normalize [h1, h2] by its L2 norm to remove common scaling."""
-
-    h1 = np.asarray(h1, dtype=np.float32)
-    h2 = np.asarray(h2, dtype=np.float32)
-    s = np.sqrt(h1 * h1 + h2 * h2 + float(eps)).astype(np.float32)
-    return (h1 / s).astype(np.float32), (h2 / s).astype(np.float32), s
-
-
-def _shape_normalize_torch(
-    h1: torch.Tensor, h2: torch.Tensor, *, eps: float = 1e-12
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    h1 = h1.to(dtype=torch.float32)
-    h2 = h2.to(dtype=torch.float32)
-    s = torch.sqrt(h1 * h1 + h2 * h2 + float(eps))
-    return h1 / s, h2 / s, s
-
-
 @dataclass
 class DeviceParams:
     Vpi_DC: float = 5.0
@@ -360,29 +341,7 @@ def generate_dataset_dbm_hist(
     dv_prev = rng.uniform(-max_step_V, max_step_V, size=n_samples).astype(np.float32)
     V_prev = np.clip(V_bias - dv_prev, 0.0, Vpi).astype(np.float32)
 
-    accel_norm = str(accel).lower().strip()
-    if accel_norm not in {"cpu", "auto", "cuda", "mps"}:
-        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda', 'mps'")
-
-    if accel_norm == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("accel='cuda' requested but torch.cuda.is_available() is False")
-    if accel_norm == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-        raise RuntimeError("accel='mps' requested but MPS is not available")
-
-    if accel_norm == "cpu":
-        device = torch.device("cpu")
-    elif accel_norm == "cuda":
-        device = torch.device("cuda")
-    elif accel_norm == "mps":
-        device = torch.device("mps")
-    else:
-        # auto
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
+    device = select_device(accel)
 
     print(f"generate_dataset_dbm_hist using device: {device}")
     if V_rf_amp > 0:
@@ -391,15 +350,7 @@ def generate_dataset_dbm_hist(
         print(f"  RF training disabled (V_rf_amp=0)")
 
     # Precompute lock-in references once per call, on the selected device.
-    n_samples_time = int(
-        round((float(dither_params.n_periods) / float(dither_params.f_dither)) * float(dither_params.Fs))
-    )
-    t = torch.arange(n_samples_time, device=device, dtype=torch.float32) / float(dither_params.Fs)
-    w = 2.0 * float(np.pi) * float(dither_params.f_dither)
-    refs = {
-        1: (torch.sin(w * t), torch.cos(w * t)),
-        2: (torch.sin(2.0 * w * t), torch.cos(2.0 * w * t)),
-    }
+    refs = make_lockin_refs(dither_params, device)
 
     def _measure_normalized_torch(v_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Measure DC-normalized harmonic amplitudes (h1/pd_dc, h2/pd_dc)."""
@@ -600,29 +551,7 @@ def train_policy(
     if seed is not None:
         torch.manual_seed(seed)
 
-    accel_norm = str(accel).lower().strip()
-    if accel_norm not in {"cpu", "auto", "cuda", "mps"}:
-        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda', 'mps'")
-
-    if accel_norm == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("accel='cuda' requested but torch.cuda.is_available() is False")
-    if accel_norm == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-        raise RuntimeError("accel='mps' requested but MPS is not available")
-
-    if accel_norm == "cpu":
-        device = torch.device("cpu")
-    elif accel_norm == "cuda":
-        device = torch.device("cuda")
-    elif accel_norm == "mps":
-        device = torch.device("mps")
-    else:
-        # auto
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
+    device = select_device(accel)
 
     print(f"train_policy using device: {device}")
 
@@ -795,43 +724,14 @@ def rollout_dbm_hist(
     f_rf : float, optional
         RF signal frequency (Hz). Default 1e9 (1 GHz).
     """
-    accel_norm = str(accel).lower().strip()
-    if accel_norm not in {"cpu", "auto", "cuda", "mps"}:
-        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda', 'mps'")
-    if accel_norm == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("accel='cuda' requested but torch.cuda.is_available() is False")
-    if accel_norm == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-        raise RuntimeError("accel='mps' requested but MPS is not available")
-
-    if accel_norm == "cpu":
-        device = torch.device("cpu")
-    elif accel_norm == "cuda":
-        device = torch.device("cuda")
-    elif accel_norm == "mps":
-        device = torch.device("mps")
-    else:
-        # auto
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
+    device = select_device(accel)
 
     # print(f"rollout_dbm_hist using device: {device}")
 
     model = model.to(device)
 
     # Precompute lock-in references once on the chosen device.
-    n_samples_time = int(
-        round((float(dither_params.n_periods) / float(dither_params.f_dither)) * float(dither_params.Fs))
-    )
-    t_ref = torch.arange(n_samples_time, device=device, dtype=torch.float32) / float(dither_params.Fs)
-    w = 2.0 * float(np.pi) * float(dither_params.f_dither)
-    refs = {
-        1: (torch.sin(w * t_ref), torch.cos(w * t_ref)),
-        2: (torch.sin(2.0 * w * t_ref), torch.cos(2.0 * w * t_ref)),
-    }
+    refs = make_lockin_refs(dither_params, device)
 
     Vpi = float(device_params.Vpi_DC)
     th_t = float(np.deg2rad(theta_target_deg))
@@ -1000,29 +900,7 @@ def rollout_dbm_hist_batch(
         Input optical power (dBm). If None, uses device_params.Pin_dBm.
         Use this to test model robustness under optical power fluctuations.
     """
-    accel_norm = str(accel).lower().strip()
-    if accel_norm not in {"cpu", "auto", "cuda", "mps"}:
-        raise ValueError("accel must be one of: 'cpu', 'auto', 'cuda', 'mps'")
-
-    if accel_norm == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("accel='cuda' requested but torch.cuda.is_available() is False")
-    if accel_norm == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
-        raise RuntimeError("accel='mps' requested but MPS is not available")
-
-    if accel_norm == "cpu":
-        device = torch.device("cpu")
-    elif accel_norm == "cuda":
-        device = torch.device("cuda")
-    elif accel_norm == "mps":
-        device = torch.device("mps")
-    else:
-        # auto
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
+    device = select_device(accel)
 
     # print(f"rollout_dbm_hist_batch using device: {device}")
 
@@ -1038,15 +916,7 @@ def rollout_dbm_hist_batch(
     sigma_t = torch.from_numpy(sigma).to(device=device, dtype=torch.float32)
 
     # Precompute lock-in references
-    n_samples_time = int(
-        round((float(dither_params.n_periods) / float(dither_params.f_dither)) * float(dither_params.Fs))
-    )
-    t_ref = torch.arange(n_samples_time, device=device, dtype=torch.float32) / float(dither_params.Fs)
-    w = 2.0 * float(np.pi) * float(dither_params.f_dither)
-    refs = {
-        1: (torch.sin(w * t_ref), torch.cos(w * t_ref)),
-        2: (torch.sin(2.0 * w * t_ref), torch.cos(2.0 * w * t_ref)),
-    }
+    refs = make_lockin_refs(dither_params, device)
 
     feature_mode_norm = str(feature_mode).lower().strip()
     if feature_mode_norm not in {"dc_norm_hist", "shape_norm_bessel", "theta_est_hist"}:
@@ -1176,8 +1046,8 @@ def rollout_dbm_hist_batch(
     return {"err_deg": err_deg_hist}
 
 
-def main() -> int:
-    """Default pipeline used by the CLI runner in scripts/."""
+def run_pipeline() -> int:
+    """Run the default dataset->train->rollout pipeline."""
 
     artifacts = Path("artifacts")
     ds_path = artifacts / "dither_dataset_dbm_hist.npz"
@@ -1235,3 +1105,7 @@ def main() -> int:
         print(f"rollout target={tgt:6.1f} deg | initV={V_init:.3f} V | final_err={final_err:+.2f} deg")
 
     return 0
+
+
+def main() -> int:
+    return run_pipeline()

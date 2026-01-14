@@ -10,7 +10,6 @@ simple NumPy dictionaries that plotting functions can consume.
 
 from __future__ import annotations
 
-import gc
 import hashlib
 import shutil
 from pathlib import Path
@@ -20,6 +19,7 @@ import numpy as np
 import torch
 
 import mzm.dither_controller as dc
+from mzm.utils import cleanup_torch
 
 
 def _load_model(model_path: str | Path):
@@ -94,11 +94,7 @@ def evaluate_model(
 
     final_errs = np.abs(r["err_deg"][:, -1])
     del r, model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    cleanup_torch()
 
     final_errs_reshaped = final_errs.reshape(len(targets), n_repeats)
     means = np.mean(final_errs_reshaped, axis=1)
@@ -271,11 +267,7 @@ def evaluate_rf_power_robustness(
         max_errors.append(float(np.max(final_errs)))
 
     del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    cleanup_torch()
 
     return {
         "V_rf_amp_values": V_rf_amp_values,
@@ -343,11 +335,7 @@ def evaluate_rf_robustness_multi_target(
             std_errors[i, j] = float(np.std(final_errs))
 
     del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    cleanup_torch()
 
     return {
         "V_rf_amp_values": V_rf_amp_values,
@@ -416,11 +404,7 @@ def evaluate_optical_power_robustness(
         max_errors.append(float(np.max(final_errs)))
 
     del model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        torch.mps.empty_cache()
+    cleanup_torch()
 
     return {
         "Pin_dBm_values": Pin_dBm_values,
