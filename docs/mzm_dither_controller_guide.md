@@ -852,6 +852,15 @@ $$
 
 注：当前仓库的默认数据集/回放实现中，dither 的 lock-in 特征为理想提取（不含 thermal/shot/RIN 的随机噪声）。上述“包含噪声”更偏向真实硬件场景或未来扩展（见 3.6 节）。
 
+### 10+.3 漂移鲁棒性（偏压 / Vpi）
+
+仓库提供“逐 step 漂移 + 闭环控制”的仿真脚本入口：`mzm/drift_simulation.py`。
+
+- **偏压漂移（加性电压扰动）**：`simulate_control_loop_with_drift(...)` 通过 `V_drift` 将传输曲线整体平移。
+- **Vpi 漂移（相位映射系数漂移）**：`simulate_control_loop_with_vpi_drift(...)` 将 `Vpi_true(t)` 用于物理测量，同时允许 `Vpi_used`（控制器/估计器假设）保持为标称值，以评估对标定失配的鲁棒性。
+
+Notebook `mzm_dither_controller.ipynb` 已提供对应示例代码块，可直接调整 `drift_step_rate` / `vpi_rel_step_rate` 扫描控制器极限。
+
 ## 11. 针对 0 度死区的优化策略
 
 在 MZM 传输曲线的极值点（如 0 度），一阶导数接近 0，导致 1f 导频信号极微弱，信噪比极低。为了解决该区域控制精度差的问题，本项目采取了以下优化措施：
@@ -990,4 +999,3 @@ requirements.txt 包含最小依赖：
     *   DSP 指令优化后，Cortex-M4 约需 0.5~1.0 ms 完成一次推理。
     *   加上 ADC 采集与 lock-in 预处理（数字积分），总回路延迟可控制在 2ms 以内。
 *   **实时性**：支持 $> 100 \text{Hz}$ 的控制更新率，远高于 MZM 热漂移带宽（通常 < 1Hz），满足实时控制要求。
-
