@@ -86,10 +86,13 @@ def _estimate_theta_from_harmonics_np(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Estimate theta in [0, pi] from (h1_norm, h2_norm), eliminating RF scaling.
 
-    Uses the analytical small-signal model:
-      h1 = 2*b*J1(beta_d)*|sin(theta)| / (a + b*J0(beta_d)*cos(theta))
-      h2 = 2*b*J2(beta_d)*|cos(theta)| / (a + b*J0(beta_d)*cos(theta))
-    where a = 1 + gamma^2, b = 2*gamma*J0(beta_rf) is a nuisance parameter.
+    Uses the analytical small-signal model described (with TeX equations) in:
+      docs/theta_inversion_theory.md
+
+    In short, we first compute:
+      p = h1_norm / (2*J1(beta_d)), q = h2_norm / (2*J2(beta_d))
+      theta_abs = atan2(p, q)
+    which cancels the RF scaling nuisance parameter via the ratio p/q = |tan(theta)|.
 
     We resolve the sign ambiguity (theta vs pi-theta) using an external prior
     (typically the commanded bias converted to phase via Vpi), which is available
@@ -573,7 +576,7 @@ def train_policy(
     
     # Scheduler to reduce LR when loss plateaus, helping to reduce fluctuations and find deeper minima
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode='min', factor=0.5, patience=500, min_lr=1e-6
+        opt, mode='min', factor=0.5, patience=300, min_lr=1e-6
     )
 
     # Note: We intentionally skip torch.compile here because it can be unstable on some
