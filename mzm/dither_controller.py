@@ -47,6 +47,11 @@ from mzm.model import (
 from mzm.utils import select_device, make_lockin_refs
 
 _DEFAULT_FEATURE_MODE = "theta_est_hist"
+_DPHI_CLIP_RAD = float(np.pi / 4.0)
+_CONF_GATE_EMA_ALPHA = 0.02
+_CONF_GATE_RATIO = 0.5
+_CONF_GATE_MIN_SCALE = 0.2
+_CONF_GATE_POWER = 1.0
 
 
 def _bessel_j1_small(x: float) -> float:
@@ -327,8 +332,10 @@ def generate_dataset_dbm_hist(
     """
 
     feature_mode_norm = str(feature_mode).lower().strip()
-    if feature_mode_norm not in {"dc_norm_hist", "shape_norm_bessel", "theta_est_hist"}:
-        raise ValueError("feature_mode must be one of: 'dc_norm_hist', 'shape_norm_bessel', 'theta_est_hist'")
+    if feature_mode_norm not in {"dc_norm_hist", "shape_norm_bessel", "theta_est_hist", "phi_bessel_hist"}:
+        raise ValueError(
+            "feature_mode must be one of: 'dc_norm_hist', 'shape_norm_bessel', 'theta_est_hist', 'phi_bessel_hist'"
+        )
 
     rng = np.random.default_rng(seed)
 
@@ -426,6 +433,34 @@ def generate_dataset_dbm_hist(
             axis=1,
         ).astype(np.float32)
         feature_version = "shape_norm_bessel_v1"
+    elif feature_mode_norm == "phi_bessel_hist":
+        beta_d = float(np.pi) * float(dither_params.V_dither_amp) / float(device_params.Vpi_DC)
+        j1 = float(_bessel_j1_small(beta_d))
+        j2 = float(_bessel_j2_small(beta_d))
+        j1 = float(j1) if abs(j1) > 1e-12 else 1e-12
+        j2 = float(j2) if abs(j2) > 1e-12 else 1e-12
+
+        p = h1.astype(np.float32) / np.float32(2.0 * j1)
+        q = h2.astype(np.float32) / np.float32(2.0 * j2)
+        p_prev = h1_prev.astype(np.float32) / np.float32(2.0 * j1)
+        q_prev = h2_prev.astype(np.float32) / np.float32(2.0 * j2)
+
+        phi = np.arctan2(p, q).astype(np.float32)  # ~ [0, pi/2]
+        phi_prev = np.arctan2(p_prev, q_prev).astype(np.float32)
+        dphi = (phi - phi_prev).astype(np.float32)
+        dphi = np.clip(dphi, -_DPHI_CLIP_RAD, _DPHI_CLIP_RAD).astype(np.float32)
+
+        X = np.stack(
+            [
+                phi,
+                dphi,
+                dv_prev.astype(np.float32),
+                te[:, 0].astype(np.float32),
+                te[:, 1].astype(np.float32),
+            ],
+            axis=1,
+        ).astype(np.float32)
+        feature_version = "phi_bessel_hist_v1"
     else:
         theta_prior = bias_to_theta_rad(V_bias.astype(float), Vpi_DC=device_params.Vpi_DC).astype(np.float32)
         theta_prior_prev = bias_to_theta_rad(V_prev.astype(float), Vpi_DC=device_params.Vpi_DC).astype(np.float32)
@@ -624,6 +659,7 @@ def save_model(
     sigma: np.ndarray,
     device_params: DeviceParams,
     dither_params: DitherParams,
+    feature_mode: str | None = None,
     feature_version: str = "legacy",
     path: str | Path,
 ) -> None:
@@ -634,6 +670,7 @@ def save_model(
         "model_state": model.state_dict(),
         "mu": mu.astype(np.float32),
         "sigma": sigma.astype(np.float32),
+        "feature_mode": None if feature_mode is None else str(feature_mode),
         "feature_version": str(feature_version),
         "arch": {
             "in_dim": getattr(model, "in_dim", int(mu.shape[0])),
@@ -694,6 +731,7 @@ def load_model(path: str | Path) -> tuple[nn.Module, dict]:
     meta = {
         "mu": np.asarray(ckpt["mu"], dtype=np.float32),
         "sigma": np.asarray(ckpt["sigma"], dtype=np.float32),
+        "feature_mode": str(ckpt.get("feature_mode", _DEFAULT_FEATURE_MODE) or _DEFAULT_FEATURE_MODE),
         "feature_version": str(ckpt.get("feature_version", "legacy")),
         "device_params": DeviceParams(**ckpt["device_params"]),
         "dither_params": DitherParams(**ckpt["dither_params"]),
@@ -717,6 +755,11 @@ def rollout_dbm_hist(
     f_rf: float = 1e9,
     max_step_V: float = 0.2,
     feature_mode: str = _DEFAULT_FEATURE_MODE,
+    confidence_gate: bool = True,
+    gate_ema_alpha: float = _CONF_GATE_EMA_ALPHA,
+    gate_ratio: float = _CONF_GATE_RATIO,
+    gate_min_scale: float = _CONF_GATE_MIN_SCALE,
+    gate_power: float = _CONF_GATE_POWER,
 ) -> dict:
     """Single-trajectory rollout with optional RF signal.
     
@@ -742,14 +785,18 @@ def rollout_dbm_hist(
     V = float(np.clip(V_init, 0.0, Vpi))
 
     feature_mode_norm = str(feature_mode).lower().strip()
-    if feature_mode_norm not in {"dc_norm_hist", "shape_norm_bessel", "theta_est_hist"}:
-        raise ValueError("feature_mode must be one of: 'dc_norm_hist', 'shape_norm_bessel', 'theta_est_hist'")
+    if feature_mode_norm not in {"dc_norm_hist", "shape_norm_bessel", "theta_est_hist", "phi_bessel_hist"}:
+        raise ValueError(
+            "feature_mode must be one of: 'dc_norm_hist', 'shape_norm_bessel', 'theta_est_hist', 'phi_bessel_hist'"
+        )
 
     prev_u1 = None
     prev_u2 = None
     prev_s = None
     prev_c = None
+    prev_phi = None
     prev_dv = 0.0
+    prev_snr = None
 
     V_hist: list[float] = []
     err_deg_hist: list[float] = []
@@ -763,6 +810,12 @@ def rollout_dbm_hist(
     theta_deg_hist: list[float] = []
     theta_est_deg_hist: list[float] = []
     b_est_hist: list[float] = []
+    phi_hist: list[float] = []
+    dphi_hist: list[float] = []
+    s_conf_hist: list[float] = []
+    dv_scale_hist: list[float] = []
+
+    te = _target_encoding(np.array([th_t], dtype=np.float32))[0]
 
     for _ in range(int(steps)):
         vb_t = torch.tensor([float(V)], device=device, dtype=torch.float32)
@@ -790,6 +843,7 @@ def rollout_dbm_hist(
             dh1 = 0.0 if prev_u1 is None else (h1 - float(prev_u1))
             dh2 = 0.0 if prev_u2 is None else (h2 - float(prev_u2))
             x0, x1, x2, x3 = h1, h2, dh1, dh2
+            x = np.array([x0, x1, x2, x3, float(prev_dv), float(te[0]), float(te[1])], dtype=np.float32)
             theta_est_deg = float("nan")
             b_est = float("nan")
         elif feature_mode_norm == "shape_norm_bessel":
@@ -804,6 +858,27 @@ def rollout_dbm_hist(
             du1 = 0.0 if prev_u1 is None else (u1 - float(prev_u1))
             du2 = 0.0 if prev_u2 is None else (u2 - float(prev_u2))
             x0, x1, x2, x3 = u1, u2, du1, du2
+            x = np.array([x0, x1, x2, x3, float(prev_dv), float(te[0]), float(te[1])], dtype=np.float32)
+            theta_est_deg = float("nan")
+            b_est = float("nan")
+        elif feature_mode_norm == "phi_bessel_hist":
+            beta_d = float(np.pi) * float(dither_params.V_dither_amp) / float(device_params.Vpi_DC)
+            j1 = float(_bessel_j1_small(beta_d))
+            j2 = float(_bessel_j2_small(beta_d))
+            j1 = float(j1) if abs(j1) > 1e-12 else 1e-12
+            j2 = float(j2) if abs(j2) > 1e-12 else 1e-12
+
+            p = float(h1) / float(2.0 * j1)
+            q = float(h2) / float(2.0 * j2)
+            phi = float(np.arctan2(np.float32(p), np.float32(q)))
+            snr_s = float(np.sqrt(np.float32(p) * np.float32(p) + np.float32(q) * np.float32(q)))
+            dphi = 0.0 if prev_phi is None else float(phi - float(prev_phi))
+            dphi = float(np.clip(dphi, -_DPHI_CLIP_RAD, _DPHI_CLIP_RAD))
+
+            x = np.array([phi, dphi, float(prev_dv), float(te[0]), float(te[1])], dtype=np.float32)
+
+            # For notebook/debug, reuse legacy slots.
+            x0, x1, x2, x3 = phi, dphi, float("nan"), float("nan")
             theta_est_deg = float("nan")
             b_est = float("nan")
         else:
@@ -822,19 +897,30 @@ def rollout_dbm_hist(
             dc = 0.0 if prev_c is None else (c - float(prev_c))
             x0, x1, x2, x3 = s, c, ds, dc
             theta_est_deg = float(np.rad2deg(theta_est))
-
-        te = _target_encoding(np.array([th_t], dtype=np.float32))[0]
-        x = np.array([x0, x1, x2, x3, float(prev_dv), float(te[0]), float(te[1])], dtype=np.float32)
+            x = np.array([x0, x1, x2, x3, float(prev_dv), float(te[0]), float(te[1])], dtype=np.float32)
         xn = (x - mu) / sigma
 
         dv = float(model(torch.from_numpy(xn).to(device).unsqueeze(0)).cpu().numpy().reshape(-1)[0])
         dv = float(np.clip(dv, -float(max_step_V), float(max_step_V)))
+        dv_scale = 1.0
+        if feature_mode_norm == "phi_bessel_hist":
+            if prev_snr is None:
+                prev_snr = float(snr_s)
+            else:
+                prev_snr = (1.0 - float(gate_ema_alpha)) * float(prev_snr) + float(gate_ema_alpha) * float(snr_s)
+            if bool(confidence_gate):
+                s_ref = float(max(1e-12, float(prev_snr) * float(gate_ratio)))
+                dv_scale = float(np.clip(float(snr_s) / s_ref, 0.0, 1.0)) ** float(gate_power)
+                dv_scale = float(max(float(gate_min_scale), float(dv_scale)))
+                dv = float(np.clip(dv * dv_scale, -float(max_step_V), float(max_step_V)))
         V = float(np.clip(V + dv, 0.0, Vpi))
 
         if feature_mode_norm == "dc_norm_hist":
             prev_u1, prev_u2 = h1, h2
         elif feature_mode_norm == "shape_norm_bessel":
             prev_u1, prev_u2 = x0, x1
+        elif feature_mode_norm == "phi_bessel_hist":
+            prev_phi = float(x0)
         else:
             prev_s, prev_c = x0, x1
         prev_dv = dv
@@ -855,8 +941,12 @@ def rollout_dbm_hist(
         theta_deg_hist.append(float(np.rad2deg(th_c)))
         theta_est_deg_hist.append(float(theta_est_deg))
         b_est_hist.append(float(b_est))
+        phi_hist.append(float(x0))
+        dphi_hist.append(float(x1))
+        s_conf_hist.append(float(snr_s) if feature_mode_norm == "phi_bessel_hist" else float("nan"))
+        dv_scale_hist.append(float(dv_scale) if feature_mode_norm == "phi_bessel_hist" else float("nan"))
 
-    return {
+    out: dict = {
         "V": np.asarray(V_hist, dtype=float),
         "err_deg": np.asarray(err_deg_hist, dtype=float),
         "dv": np.asarray(dv_hist, dtype=float),
@@ -870,6 +960,12 @@ def rollout_dbm_hist(
         "theta_est_deg": np.asarray(theta_est_deg_hist, dtype=float),
         "b_est": np.asarray(b_est_hist, dtype=float),
     }
+    if feature_mode_norm == "phi_bessel_hist":
+        out["phi"] = np.asarray(phi_hist, dtype=float)
+        out["dphi"] = np.asarray(dphi_hist, dtype=float)
+        out["s_conf"] = np.asarray(s_conf_hist, dtype=float)
+        out["dv_scale"] = np.asarray(dv_scale_hist, dtype=float)
+    return out
 
 
 @torch.no_grad()
@@ -889,6 +985,11 @@ def rollout_dbm_hist_batch(
     Pin_dBm: float | None = None,
     max_step_V: float = 0.2,
     feature_mode: str = _DEFAULT_FEATURE_MODE,
+    confidence_gate: bool = True,
+    gate_ema_alpha: float = _CONF_GATE_EMA_ALPHA,
+    gate_ratio: float = _CONF_GATE_RATIO,
+    gate_min_scale: float = _CONF_GATE_MIN_SCALE,
+    gate_power: float = _CONF_GATE_POWER,
 ) -> dict:
     """Batch rollout with optional RF signal and optical power override for robustness testing.
     
@@ -922,15 +1023,19 @@ def rollout_dbm_hist_batch(
     refs = make_lockin_refs(dither_params, device)
 
     feature_mode_norm = str(feature_mode).lower().strip()
-    if feature_mode_norm not in {"dc_norm_hist", "shape_norm_bessel", "theta_est_hist"}:
-        raise ValueError("feature_mode must be one of: 'dc_norm_hist', 'shape_norm_bessel', 'theta_est_hist'")
+    if feature_mode_norm not in {"dc_norm_hist", "shape_norm_bessel", "theta_est_hist", "phi_bessel_hist"}:
+        raise ValueError(
+            "feature_mode must be one of: 'dc_norm_hist', 'shape_norm_bessel', 'theta_est_hist', 'phi_bessel_hist'"
+        )
 
     # State initialization
     prev_u1 = None
     prev_u2 = None
     prev_s = None
     prev_c = None
+    prev_phi = None
     prev_dv = torch.zeros_like(V)
+    prev_snr = None
 
     # History storage (on CPU to save GPU memory if steps are large, or keep on GPU?)
     # Keeping on CPU is safer for large batches.
@@ -990,6 +1095,26 @@ def rollout_dbm_hist_batch(
             x0, x1, x2, x3 = u1, u2, du1, du2
             prev_next_0 = u1
             prev_next_1 = u2
+        elif feature_mode_norm == "phi_bessel_hist":
+            beta_d = float(np.pi) * float(dither_params.V_dither_amp) / float(device_params.Vpi_DC)
+            j1 = float(_bessel_j1_small(beta_d))
+            j2 = float(_bessel_j2_small(beta_d))
+            j1 = j1 if abs(j1) > 1e-12 else 1e-12
+            j2 = j2 if abs(j2) > 1e-12 else 1e-12
+            p = h1 / float(2.0 * j1)
+            q = h2 / float(2.0 * j2)
+            phi = torch.atan2(p, q)
+            if prev_phi is None:
+                dphi = torch.zeros_like(phi)
+            else:
+                dphi = phi - prev_phi
+            dphi = torch.clamp(dphi, -_DPHI_CLIP_RAD, _DPHI_CLIP_RAD)
+            prev_phi = phi
+            snr_s = torch.sqrt(p * p + q * q + 1e-24)
+            if prev_snr is None:
+                prev_snr = snr_s
+            else:
+                prev_snr = (1.0 - float(gate_ema_alpha)) * prev_snr + float(gate_ema_alpha) * snr_s
         else:
             theta_est, _ = _estimate_theta_from_harmonics_torch(
                 h1,
@@ -1010,14 +1135,20 @@ def rollout_dbm_hist_batch(
             prev_next_0 = s
             prev_next_1 = c
 
-        # Construct input
-        # x: [x0, x1, x2, x3, prev_dv, sin(th), cos(th)]
-        x = torch.stack([x0, x1, x2, x3, prev_dv, te_sin, te_cos], dim=1)
+        if feature_mode_norm == "phi_bessel_hist":
+            x = torch.stack([phi, dphi, prev_dv, te_sin, te_cos], dim=1)
+        else:
+            x = torch.stack([x0, x1, x2, x3, prev_dv, te_sin, te_cos], dim=1)
         xn = (x - mu_t) / sigma_t
 
         # Inference
         dv = model(xn).squeeze(1)  # (N, 1) -> (N,)
         dv = torch.clamp(dv, -float(max_step_V), float(max_step_V))
+        if feature_mode_norm == "phi_bessel_hist" and bool(confidence_gate):
+            s_ref = torch.clamp(prev_snr * float(gate_ratio), min=1e-12)
+            dv_scale = torch.clamp(snr_s / s_ref, 0.0, 1.0) ** float(gate_power)
+            dv_scale = torch.clamp(dv_scale, min=float(gate_min_scale), max=1.0)
+            dv = torch.clamp(dv * dv_scale, -float(max_step_V), float(max_step_V))
 
         # Update
         V = torch.clamp(V + dv, 0.0, Vpi)
@@ -1026,7 +1157,7 @@ def rollout_dbm_hist_batch(
         if feature_mode_norm in {"dc_norm_hist", "shape_norm_bessel"}:
             prev_u1 = prev_next_0
             prev_u2 = prev_next_1
-        else:
+        elif feature_mode_norm == "theta_est_hist":
             prev_s = prev_next_0
             prev_c = prev_next_1
         prev_dv = dv

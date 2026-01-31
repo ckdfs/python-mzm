@@ -20,6 +20,28 @@ from .dither_controller import DeviceParams, DitherParams, _estimate_theta_from_
 from .utils import make_lockin_refs
 
 
+def _infer_feature_mode(feature_mode: str | None, mu) -> str:
+    if feature_mode is not None:
+        return str(feature_mode).lower().strip()
+    mu_arr = np.asarray(mu)
+    if mu_arr.ndim >= 1 and int(mu_arr.shape[0]) == 5:
+        return "phi_bessel_hist"
+    return "theta_est_hist"
+
+
+def _bessel_j1_small(x: float) -> float:
+    x2 = float(x) * float(x)
+    return float(x) / 2.0 - (float(x) * x2) / 16.0 + (float(x) * x2 * x2) / 384.0
+
+
+def _bessel_j2_small(x: float) -> float:
+    x2 = float(x) * float(x)
+    return x2 / 8.0 - (x2 * x2) / 96.0 + (x2 * x2 * x2) / 3072.0
+
+
+_DPHI_CLIP_RAD = float(np.pi / 4.0)
+
+
 def _estimate_theta_signed_from_lockin_np(
     *,
     h1_I_norm: float,
@@ -86,16 +108,19 @@ def simulate_control_loop_with_drift(
     n_steps=200,
     target_theta_deg=90.0,
     max_step_V=0.2,
-    drift_step_rate=0.002
+    drift_step_rate=0.002,
+    feature_mode: str | None = None,
 ):
     """
     Simulate the closed-loop control under bias drift using a trained model.
-    Feature Mode: 'theta_est_hist'
+    Feature Mode: inferred from mu (7->theta_est_hist, 5->phi_bessel_hist) unless provided.
     """
+    feature_mode_norm = _infer_feature_mode(feature_mode, mu)
     print(f"\\n--- Starting Bias Drift Simulation (Steps: {n_steps}) ---")
     print(f"Target Theta: {target_theta_deg} deg")
     print(f"Dither Amp: {dither_params.V_dither_amp} V")
     print(f"Drift Rate: {drift_step_rate} V/step")
+    print(f"Feature Mode: {feature_mode_norm}")
     
     # Simulation state
     # Start at 'perfect' guess for 2.5V (Quadrature) if target is 90
@@ -109,8 +134,10 @@ def simulate_control_loop_with_drift(
     # History state
     prev_s = 0.0
     prev_c = 0.0
+    prev_h1 = None
+    prev_h2 = None
+    prev_phi = None
     prev_dv = 0.0
-    prev_theta_est = None
     
     # Logging
     history = []
@@ -135,13 +162,13 @@ def simulate_control_loop_with_drift(
         # 1. Calculate Shift
         v_drift = get_bias_drift(t, step_rate=drift_step_rate)
         
-        # 2. Measurement (Physics Simulation)
+        # 2. Measurement (Physics Simulation) - match training (DC-normalized magnitudes)
         v_batch = torch.tensor([V_bias_current], dtype=torch.float32)
         drift_batch = torch.tensor([v_drift], dtype=torch.float32)
         
         with torch.no_grad():
-            out = _measure_pd_dither_1f2f_batch_torch(
-                V_bias=v_batch.to(dtype=torch.float64),
+            h1_t, h2_t, _ = measure_pd_dither_normalized_batch_torch(
+                V_bias=v_batch,
                 V_dither_amp=float(dither_params.V_dither_amp),
                 f_dither=float(dither_params.f_dither),
                 Fs=float(dither_params.Fs),
@@ -154,49 +181,50 @@ def simulate_control_loop_with_drift(
                 R_load=float(device_params.R_load),
                 refs=refs,
                 V_rf_amp=0.0,
-                V_drift=drift_batch.to(dtype=torch.float64),
+                V_drift=drift_batch,
             )
+            h1 = float(h1_t[0].item())
+            h2 = float(h2_t[0].item())
 
-            pd_dc = float(out["pd_dc"][0].item())
-            h1_I = float(out["h1_I"][0].item())
-            h2_Q = float(out["h2_Q"][0].item())
+            if feature_mode_norm == "phi_bessel_hist":
+                beta_d = float(np.pi) * float(dither_params.V_dither_amp) / float(device_params.Vpi_DC)
+                j1 = float(_bessel_j1_small(beta_d))
+                j2 = float(_bessel_j2_small(beta_d))
+                j1 = float(j1) if abs(j1) > 1e-12 else 1e-12
+                j2 = float(j2) if abs(j2) > 1e-12 else 1e-12
+                p = float(h1) / float(2.0 * j1)
+                q = float(h2) / float(2.0 * j2)
+                phi = float(np.arctan2(np.float32(p), np.float32(q)))
+                dphi = 0.0 if prev_phi is None else float(phi - float(prev_phi))
+                dphi = float(np.clip(dphi, -_DPHI_CLIP_RAD, _DPHI_CLIP_RAD))
+                prev_phi = float(phi)
+                obs_list = [phi, dphi, float(prev_dv), float(target_sin), float(target_cos)]
+                theta_est = float("nan")
+            else:
+                theta_prior = float(bias_to_theta_rad(V_bias_current, Vpi_DC=float(device_params.Vpi_DC)))
+                theta_est_arr, _ = _estimate_theta_from_harmonics_np(
+                    np.array([h1], dtype=np.float32),
+                    np.array([h2], dtype=np.float32),
+                    theta_prior_rad=np.array([theta_prior], dtype=np.float32),
+                    dither_params=dither_params,
+                    device_params=device_params,
+                )
+                theta_est = float(theta_est_arr[0])
+                s = float(np.sin(theta_est))
+                c = float(np.cos(theta_est))
+                if t == 0:
+                    prev_s = s
+                    prev_c = c
+                ds = s - float(prev_s)
+                dc = c - float(prev_c)
+                prev_s = float(s)
+                prev_c = float(c)
+                obs_list = [s, c, ds, dc, float(prev_dv), float(target_sin), float(target_cos)]
 
-            h1_I_norm = h1_I / (pd_dc + 1e-12)
-            h2_Q_norm = h2_Q / (pd_dc + 1e-12)
+            prev_h1 = h1
+            prev_h2 = h2
 
-            theta_est = _estimate_theta_signed_from_lockin_np(
-                h1_I_norm=h1_I_norm,
-                h2_Q_norm=h2_Q_norm,
-                dither_params=dither_params,
-                Vpi_DC=float(device_params.Vpi_DC),
-            )
-            
-            # 2. Compute Sin/Cos features
-            s = np.sin(theta_est)
-            c = np.cos(theta_est)
-            
-            # 3. Compute Delta Sin/Cos
-            if t == 0:
-                # Initialize history with current state to avoid jump
-                prev_s = s
-                prev_c = c
-                
-            ds = s - prev_s
-            dc = c - prev_c
-            
-            # 4. Construct Feature Vector
-            # [s, c, ds, dc, dv_prev, target_sin, target_cos]
-            obs_list = [
-                s,
-                c,
-                ds,
-                dc,
-                prev_dv,
-                target_sin, 
-                target_cos
-            ]
-            
-            obs_raw = torch.tensor([obs_list], dtype=torch.float32) # [1, 7]
+            obs_raw = torch.tensor([obs_list], dtype=torch.float32)
             
             # Normalize
             obs_norm = (obs_raw - mu_t) / sigma_t
@@ -211,8 +239,6 @@ def simulate_control_loop_with_drift(
         V_bias_current += delta_v_clipped
         
         # Update History
-        prev_s = s
-        prev_c = c
         prev_dv = delta_v_clipped # Use the action we actually took
         
         # --- Logging ---
@@ -227,8 +253,9 @@ def simulate_control_loop_with_drift(
             'v_actual': v_actual,
             'theta_err': phase_err,
             'theta_est_deg': np.degrees(theta_est),
-            'h1': float(h1_I_norm),
-            'h2': float(h2_Q_norm),
+            'h1': float(h1),
+            'h2': float(h2),
+            'feature_mode': feature_mode_norm,
         })
         
     return history
@@ -247,6 +274,7 @@ def simulate_control_loop_with_vpi_drift(
     vpi_abs_step_rate: float = 0.0,
     controller_knows_vpi: bool = False,
     clamp_bias: bool = True,
+    feature_mode: str | None = None,
 ) -> list[dict]:
     """Simulate the closed-loop control under Vpi drift using a trained model.
 
@@ -255,6 +283,7 @@ def simulate_control_loop_with_vpi_drift(
     - Vpi_used(t): used by the *controller/estimator* (theta prior + inversion)
     """
 
+    feature_mode_norm = _infer_feature_mode(feature_mode, mu)
     Vpi_nom = float(device_params.Vpi_DC)
 
     print(f"\\n--- Starting Vpi Drift Simulation (Steps: {n_steps}) ---")
@@ -265,6 +294,7 @@ def simulate_control_loop_with_vpi_drift(
     else:
         print(f"Vpi Drift: {vpi_rel_step_rate} (relative)/step")
     print(f"Controller knows Vpi: {controller_knows_vpi}")
+    print(f"Feature Mode: {feature_mode_norm}")
 
     theta_target = np.radians(float(target_theta_deg))
     target_sin = float(np.sin(theta_target))
@@ -275,6 +305,7 @@ def simulate_control_loop_with_vpi_drift(
 
     prev_s = 0.0
     prev_c = 0.0
+    prev_phi = None
     prev_dv = 0.0
     history: list[dict] = []
 
@@ -326,34 +357,49 @@ def simulate_control_loop_with_vpi_drift(
             h1 = float(h1_t.item())
             h2 = float(h2_t.item())
 
-            # Estimation prior uses Vpi_used
             theta_prior = float(bias_to_theta_rad(V_bias_current, Vpi_DC=Vpi_used))
 
-            # Theta inversion uses Vpi_used (affects beta_d)
-            device_params_used = (
-                device_params if float(device_params.Vpi_DC) == float(Vpi_used) else replace(device_params, Vpi_DC=Vpi_used)
-            )
-            theta_est_rad, _ = _estimate_theta_from_harmonics_np(
-                np.array([h1]),
-                np.array([h2]),
-                theta_prior_rad=np.array([theta_prior]),
-                dither_params=dither_params,
-                device_params=device_params_used,
-            )
-            theta_est = float(theta_est_rad[0])
+            if feature_mode_norm == "phi_bessel_hist":
+                beta_d = float(np.pi) * float(dither_params.V_dither_amp) / float(Vpi_used)
+                j1 = float(_bessel_j1_small(beta_d))
+                j2 = float(_bessel_j2_small(beta_d))
+                j1 = float(j1) if abs(j1) > 1e-12 else 1e-12
+                j2 = float(j2) if abs(j2) > 1e-12 else 1e-12
+                p = float(h1) / float(2.0 * j1)
+                q = float(h2) / float(2.0 * j2)
+                phi = float(np.arctan2(np.float32(p), np.float32(q)))
+                dphi = 0.0 if prev_phi is None else float(phi - float(prev_phi))
+                dphi = float(np.clip(dphi, -_DPHI_CLIP_RAD, _DPHI_CLIP_RAD))
+                prev_phi = float(phi)
+                obs_list = [phi, dphi, float(prev_dv), float(target_sin), float(target_cos)]
+                theta_est = float("nan")
+            else:
+                device_params_used = (
+                    device_params
+                    if float(device_params.Vpi_DC) == float(Vpi_used)
+                    else replace(device_params, Vpi_DC=Vpi_used)
+                )
+                theta_est_rad, _ = _estimate_theta_from_harmonics_np(
+                    np.array([h1], dtype=np.float32),
+                    np.array([h2], dtype=np.float32),
+                    theta_prior_rad=np.array([theta_prior], dtype=np.float32),
+                    dither_params=dither_params,
+                    device_params=device_params_used,
+                )
+                theta_est = float(theta_est_rad[0])
 
-            s = float(np.sin(theta_est))
-            c = float(np.cos(theta_est))
+                s = float(np.sin(theta_est))
+                c = float(np.cos(theta_est))
 
-            if t == 0:
-                prev_s = s
-                prev_c = c
+                if t == 0:
+                    prev_s = s
+                    prev_c = c
 
-            ds = s - prev_s
-            dc = c - prev_c
+                ds = s - prev_s
+                dc = c - prev_c
 
-            obs_list = [s, c, ds, dc, prev_dv, target_sin, target_cos]
-            obs_raw = torch.tensor([obs_list], dtype=torch.float32)  # [1, 7]
+                obs_list = [s, c, ds, dc, prev_dv, target_sin, target_cos]
+            obs_raw = torch.tensor([obs_list], dtype=torch.float32)
             obs_norm = (obs_raw - mu_t) / sigma_t
             delta_v = float(model(obs_norm)[0].item())
 
@@ -362,8 +408,9 @@ def simulate_control_loop_with_vpi_drift(
         if bool(clamp_bias):
             V_bias_current = float(np.clip(V_bias_current, 0.0, Vpi_nom))
 
-        prev_s = s
-        prev_c = c
+        if feature_mode_norm != "phi_bessel_hist":
+            prev_s = s
+            prev_c = c
         prev_dv = delta_v_clipped
 
         theta_actual = float(bias_to_theta_rad(V_bias_current, Vpi_DC=float(Vpi_true)))
@@ -407,9 +454,11 @@ def simulate_adaptive_control_loop(
     conf_h2_min_abs: float = 1e-6,
     update_max_rel: float = 0.05,
     buffer_len: int = 5,
+    feature_mode: str | None = None,
 ) -> list[dict]:
     """Simulate adaptive control loop with online Vpi estimation via grid search."""
 
+    feature_mode_norm = _infer_feature_mode(feature_mode, mu)
     Vpi_nom = float(device_params.Vpi_DC)
 
     print(f"\n--- Starting Adaptive Vpi Control (Steps: {n_steps}) ---")
@@ -418,6 +467,7 @@ def simulate_adaptive_control_loop(
         print(f"Vpi Drift: {vpi_abs_step_rate} V/step")
     else:
         print(f"Vpi Drift: {vpi_rel_step_rate} (relative)/step")
+    print(f"Feature Mode: {feature_mode_norm}")
 
     theta_target = np.radians(float(target_theta_deg))
     target_sin = float(np.sin(theta_target))
@@ -428,6 +478,7 @@ def simulate_adaptive_control_loop(
 
     prev_s = 0.0
     prev_c = 0.0
+    prev_phi = None
     prev_dv = 0.0
     h2_abs_ema = 0.0
     vpi_buf: deque[float] = deque(maxlen=int(buffer_len))
@@ -535,17 +586,33 @@ def simulate_adaptive_control_loop(
                 device_params=dp_est,
             )
             theta_est = float(theta_est_rad[0])
-            s = float(np.sin(theta_est))
-            c = float(np.cos(theta_est))
+            if feature_mode_norm == "phi_bessel_hist":
+                beta_d = float(np.pi) * float(dither_params.V_dither_amp) / float(Vpi_est)
+                j1 = float(_bessel_j1_small(beta_d))
+                j2 = float(_bessel_j2_small(beta_d))
+                j1 = float(j1) if abs(j1) > 1e-12 else 1e-12
+                j2 = float(j2) if abs(j2) > 1e-12 else 1e-12
+                p = float(h1) / float(2.0 * j1)
+                q = float(h2) / float(2.0 * j2)
+                phi = float(np.arctan2(np.float32(p), np.float32(q)))
+                dphi = 0.0 if prev_phi is None else float(phi - float(prev_phi))
+                dphi = float(np.clip(dphi, -_DPHI_CLIP_RAD, _DPHI_CLIP_RAD))
+                prev_phi = float(phi)
+                obs_list = [phi, dphi, float(prev_dv), float(target_sin), float(target_cos)]
+                s = float("nan")
+                c = float("nan")
+            else:
+                s = float(np.sin(theta_est))
+                c = float(np.cos(theta_est))
 
-            if t == 0:
-                prev_s = s
-                prev_c = c
+                if t == 0:
+                    prev_s = s
+                    prev_c = c
 
-            ds = s - prev_s
-            dc = c - prev_c
+                ds = s - prev_s
+                dc = c - prev_c
 
-            obs_list = [s, c, ds, dc, prev_dv, target_sin, target_cos]
+                obs_list = [s, c, ds, dc, prev_dv, target_sin, target_cos]
             obs_raw = torch.tensor([obs_list], dtype=torch.float32)
             obs_norm = (obs_raw - mu_t) / sigma_t
             
@@ -559,8 +626,9 @@ def simulate_adaptive_control_loop(
         if bool(clamp_bias):
             V_bias_current = float(np.clip(V_bias_current, 0.0, Vpi_nom))
 
-        prev_s = s
-        prev_c = c
+        if feature_mode_norm != "phi_bessel_hist":
+            prev_s = s
+            prev_c = c
         prev_dv = delta_v_clipped
 
         theta_actual = float(bias_to_theta_rad(V_bias_current, Vpi_DC=float(Vpi_true)))
@@ -583,6 +651,7 @@ def simulate_adaptive_control_loop(
                 "theta_est_deg": float(np.degrees(theta_est)),
                 "h1": float(h1),
                 "h2": float(h2),
+                "feature_mode": feature_mode_norm,
             }
         )
 
@@ -719,6 +788,7 @@ def run_vpi_drift_comparison(
     update_max_rel: float = 0.05,
     buffer_len: int = 5,
     show: bool = True,
+    feature_mode: str | None = None,
 ):
     vpi_abs_step_rate = float(vpi_drift_total_V) / float(n_steps)
 
@@ -734,6 +804,7 @@ def run_vpi_drift_comparison(
         vpi_abs_step_rate=float(vpi_abs_step_rate),
         max_step_V=float(max_step_V),
         controller_knows_vpi=False,
+        feature_mode=feature_mode,
     )
 
     print("Running Adaptive Controller...")
@@ -753,6 +824,7 @@ def run_vpi_drift_comparison(
         conf_h2_min_abs=float(conf_h2_min_abs),
         update_max_rel=float(update_max_rel),
         buffer_len=int(buffer_len),
+        feature_mode=feature_mode,
     )
 
     fig = plot_vpi_drift_comparison(

@@ -52,6 +52,7 @@ class SimulationResult:
     spectrum: SpectrumResult
     bias_scan: BiasScanResult
     Pin_dBm: float
+    pd_tap: float = 1.0
 
 
 def simulate_mzm(
@@ -65,6 +66,7 @@ def simulate_mzm(
     Responsivity: float = 0.786,
     R_load: float = 50.0,
     Pin_dBm: float = 10.0,
+    pd_tap: float = 1.0,
     Temp_K: float = 290.0,
     RIN_dB_Hz: float = -145.0,
     f_rf: float = 1e9,
@@ -114,11 +116,16 @@ def simulate_mzm(
         np.exp(1j * phi1) + gamma * np.exp(1j * phi2)
     )
 
+    if float(pd_tap) <= 0:
+        raise ValueError("pd_tap must be > 0")
+
     P_opt_inst_W = np.abs(E_out) ** 2
-    P_pd_avg_W = np.mean(P_opt_inst_W)
+    # Optical power seen by PD after an optional tap (e.g., 1:9 coupler).
+    P_pd_inst_W = P_opt_inst_W * float(pd_tap)
+    P_pd_avg_W = np.mean(P_pd_inst_W)
     P_pd_avg_dBm = 10.0 * np.log10(P_pd_avg_W * 1000.0 + 1e-30)
 
-    I_pd = Responsivity * P_opt_inst_W
+    I_pd = Responsivity * P_pd_inst_W
 
     # 4. Noise calculation
     I_av = float(np.mean(I_pd))
@@ -235,6 +242,7 @@ def simulate_mzm(
         spectrum=spectrum_res,
         bias_scan=bias_res,
         Pin_dBm=Pin_dBm,
+        pd_tap=float(pd_tap),
     )
 
 
@@ -280,6 +288,7 @@ def _measure_pd_dither_1f2f_batch_torch(
     ER_dB: float,
     IL_dB: float,
     Pin_dBm: float,
+    pd_tap: float = 1.0,
     Responsivity: float,
     R_load: float,
     refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
@@ -339,6 +348,8 @@ def _measure_pd_dither_1f2f_batch_torch(
 
     # DC transfer in torch
     Pin_W = 10.0 ** ((float(Pin_dBm) - 30.0) / 10.0)
+    if float(pd_tap) <= 0:
+        raise ValueError("pd_tap must be > 0")
     
     loss_factor = 10.0 ** (-float(IL_dB) / 10.0)
     er_linear = 10.0 ** (float(ER_dB) / 20.0)
@@ -364,7 +375,9 @@ def _measure_pd_dither_1f2f_batch_torch(
     theta_t = (float(np.pi) / float(Vpi_DC)) * V_t
     term_interf = 2.0 * float(gamma) * j0_scale * torch.cos(theta_t)
     
-    P_W = P_scale * (term_const + term_interf)  # [B, N]
+    P_W = P_scale * (term_const + term_interf)  # [B, N] (MZM output)
+    # Tap/coupler after MZM, before PD.
+    P_W = P_W * float(pd_tap)
 
     # PD current
     I_pd = float(Responsivity) * P_W
@@ -450,6 +463,7 @@ def measure_pd_dither_1f2f(
     ER_dB: float = 30.0,
     IL_dB: float = 6.0,
     Pin_dBm: float = 10.0,
+    pd_tap: float = 1.0,
     Responsivity: float = 0.786,
     R_load: float = 50.0,
     feature: str = "signed",
@@ -488,6 +502,7 @@ def measure_pd_dither_1f2f(
         ER_dB=float(ER_dB),
         IL_dB=float(IL_dB),
         Pin_dBm=float(Pin_dBm),
+        pd_tap=float(pd_tap),
         Responsivity=float(Responsivity),
         R_load=float(R_load),
         refs=None,
@@ -544,6 +559,7 @@ def measure_pd_dither_1f2f_dbm_batch_torch(
     ER_dB: float = 30.0,
     IL_dB: float = 6.0,
     Pin_dBm: float = 10.0,
+    pd_tap: float = 1.0,
     Responsivity: float = 0.786,
     R_load: float = 50.0,
     refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
@@ -577,6 +593,7 @@ def measure_pd_dither_1f2f_dbm_batch_torch(
         ER_dB=float(ER_dB),
         IL_dB=float(IL_dB),
         Pin_dBm=float(Pin_dBm),
+        pd_tap=float(pd_tap),
         Responsivity=float(Responsivity),
         R_load=float(R_load),
         refs=refs,
@@ -599,6 +616,7 @@ def measure_pd_dither_normalized_batch_torch(
     ER_dB: float = 30.0,
     IL_dB: float = 6.0,
     Pin_dBm: float = 10.0,
+    pd_tap: float = 1.0,
     Responsivity: float = 0.786,
     R_load: float = 50.0,
     refs: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
@@ -635,6 +653,7 @@ def measure_pd_dither_normalized_batch_torch(
         ER_dB=float(ER_dB),
         IL_dB=float(IL_dB),
         Pin_dBm=float(Pin_dBm),
+        pd_tap=float(pd_tap),
         Responsivity=float(Responsivity),
         R_load=float(R_load),
         refs=refs,

@@ -62,10 +62,16 @@ def evaluate_model(
     accel: str = "auto",
     seed: int | None = None,
     label: str | None = None,
+    confidence_gate: bool = True,
+    gate_ema_alpha: float = dc._CONF_GATE_EMA_ALPHA,
+    gate_ratio: float = dc._CONF_GATE_RATIO,
+    gate_min_scale: float = dc._CONF_GATE_MIN_SCALE,
+    gate_power: float = dc._CONF_GATE_POWER,
 ) -> dict:
     """Angle sweep 0–180° with repeats; returns mean/std/min/max per angle."""
 
     model, meta = _load_model(model_path)
+    feature_mode = str(meta.get("feature_mode", "theta_est_hist") or "theta_est_hist")
 
     targets = np.arange(0, 181, 1, dtype=float)
     device_params = meta["device_params"]
@@ -90,6 +96,12 @@ def evaluate_model(
         accel=accel,
         V_rf_amp=float(V_rf_amp),
         f_rf=float(f_rf),
+        feature_mode=feature_mode,
+        confidence_gate=bool(confidence_gate),
+        gate_ema_alpha=float(gate_ema_alpha),
+        gate_ratio=float(gate_ratio),
+        gate_min_scale=float(gate_min_scale),
+        gate_power=float(gate_power),
     )
 
     final_errs = np.abs(r["err_deg"][:, -1])
@@ -123,6 +135,11 @@ def evaluate_current_and_best(
     f_rf: float = 1e9,
     accel: str = "auto",
     seed: int | None = None,
+    confidence_gate: bool = True,
+    gate_ema_alpha: float = dc._CONF_GATE_EMA_ALPHA,
+    gate_ratio: float = dc._CONF_GATE_RATIO,
+    gate_min_scale: float = dc._CONF_GATE_MIN_SCALE,
+    gate_power: float = dc._CONF_GATE_POWER,
 ) -> tuple[dict, dict | None, str | None]:
     """
     评估当前模型，并与历史最佳进行对比与更新。
@@ -143,6 +160,11 @@ def evaluate_current_and_best(
         accel=accel,
         seed=seed,
         label="Current Model",
+        confidence_gate=bool(confidence_gate),
+        gate_ema_alpha=float(gate_ema_alpha),
+        gate_ratio=float(gate_ratio),
+        gate_min_scale=float(gate_min_scale),
+        gate_power=float(gate_power),
     )
 
     # If feature versions differ, comparisons are meaningless; keep best untouched.
@@ -182,6 +204,11 @@ def evaluate_current_and_best(
             accel=accel,
             seed=seed,
             label="Best Model",
+            confidence_gate=bool(confidence_gate),
+            gate_ema_alpha=float(gate_ema_alpha),
+            gate_ratio=float(gate_ratio),
+            gate_min_scale=float(gate_min_scale),
+            gate_power=float(gate_power),
         )
 
     update_action: str | None = None
@@ -222,6 +249,11 @@ def evaluate_rf_power_robustness(
     n_repeats: int = 100,
     accel: str = "auto",
     seed: int = 42,
+    confidence_gate: bool = True,
+    gate_ema_alpha: float = dc._CONF_GATE_EMA_ALPHA,
+    gate_ratio: float = dc._CONF_GATE_RATIO,
+    gate_min_scale: float = dc._CONF_GATE_MIN_SCALE,
+    gate_power: float = dc._CONF_GATE_POWER,
 ) -> dict:
     """Evaluate robustness vs RF amplitude at a single target angle."""
 
@@ -230,6 +262,7 @@ def evaluate_rf_power_robustness(
     V_rf_amp_values = np.asarray(V_rf_amp_values, dtype=float)
 
     model, meta = _load_model(model_path)
+    feature_mode = str(meta.get("feature_mode", "theta_est_hist") or "theta_est_hist")
     device_params = meta["device_params"]
     dither_params = meta["dither_params"]
     mu = meta["mu"]
@@ -258,6 +291,12 @@ def evaluate_rf_power_robustness(
             accel=accel,
             V_rf_amp=float(V_rf_amp),
             f_rf=float(f_rf),
+            feature_mode=feature_mode,
+            confidence_gate=bool(confidence_gate),
+            gate_ema_alpha=float(gate_ema_alpha),
+            gate_ratio=float(gate_ratio),
+            gate_min_scale=float(gate_min_scale),
+            gate_power=float(gate_power),
         )
 
         final_errs = np.abs(r["err_deg"][:, -1])
@@ -289,6 +328,11 @@ def evaluate_rf_robustness_multi_target(
     n_repeats: int = 50,
     accel: str = "auto",
     seed: int = 42,
+    confidence_gate: bool = True,
+    gate_ema_alpha: float = dc._CONF_GATE_EMA_ALPHA,
+    gate_ratio: float = dc._CONF_GATE_RATIO,
+    gate_min_scale: float = dc._CONF_GATE_MIN_SCALE,
+    gate_power: float = dc._CONF_GATE_POWER,
 ) -> dict:
     """Evaluate RF robustness across multiple target angles and amplitudes."""
 
@@ -301,6 +345,7 @@ def evaluate_rf_robustness_multi_target(
     target_angles = np.asarray(target_angles, dtype=float)
 
     model, meta = _load_model(model_path)
+    feature_mode = str(meta.get("feature_mode", "theta_est_hist") or "theta_est_hist")
     device_params = meta["device_params"]
     dither_params = meta["dither_params"]
     mu = meta["mu"]
@@ -328,6 +373,12 @@ def evaluate_rf_robustness_multi_target(
                 accel=accel,
                 V_rf_amp=float(V_rf_amp),
                 f_rf=float(f_rf),
+                feature_mode=feature_mode,
+                confidence_gate=bool(confidence_gate),
+                gate_ema_alpha=float(gate_ema_alpha),
+                gate_ratio=float(gate_ratio),
+                gate_min_scale=float(gate_min_scale),
+                gate_power=float(gate_power),
             )
 
             final_errs = np.abs(r["err_deg"][:, -1])
@@ -357,6 +408,11 @@ def evaluate_optical_power_robustness(
     f_rf: float = 1e9,
     accel: str = "auto",
     seed: int = 42,
+    confidence_gate: bool = True,
+    gate_ema_alpha: float = dc._CONF_GATE_EMA_ALPHA,
+    gate_ratio: float = dc._CONF_GATE_RATIO,
+    gate_min_scale: float = dc._CONF_GATE_MIN_SCALE,
+    gate_power: float = dc._CONF_GATE_POWER,
 ) -> dict:
     """Evaluate robustness vs input optical power (Pin_dBm)."""
 
@@ -365,6 +421,7 @@ def evaluate_optical_power_robustness(
     Pin_dBm_values = np.asarray(Pin_dBm_values, dtype=float)
 
     model, meta = _load_model(model_path)
+    feature_mode = str(meta.get("feature_mode", "theta_est_hist") or "theta_est_hist")
     device_params = meta["device_params"]
     dither_params = meta["dither_params"]
     mu = meta["mu"]
@@ -395,6 +452,12 @@ def evaluate_optical_power_robustness(
             V_rf_amp=float(V_rf_amp),
             f_rf=float(f_rf),
             Pin_dBm=float(Pin),
+            feature_mode=feature_mode,
+            confidence_gate=bool(confidence_gate),
+            gate_ema_alpha=float(gate_ema_alpha),
+            gate_ratio=float(gate_ratio),
+            gate_min_scale=float(gate_min_scale),
+            gate_power=float(gate_power),
         )
 
         final_errs = np.abs(r["err_deg"][:, -1])
